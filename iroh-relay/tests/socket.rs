@@ -439,3 +439,156 @@ async fn socket_requires_an_ipv4_socket() {
     let inner = TokioRuntime.wrap_udp_socket(socket).unwrap();
     assert!(RelaySocket::new(inner).is_err());
 }
+
+fn bob_id() -> iroh_relay::server::ClientId {
+    iroh_relay::server::ClientId::new("bob")
+}
+
+/// A transport configuration with multipath and NAT traversal, which lets a connection
+/// add a direct path next to a relayed one.
+fn traversal_transport() -> Arc<noq::TransportConfig> {
+    let mut transport = noq::TransportConfig::default();
+    transport.max_remote_nat_traversal_addresses(8);
+    transport.send_observed_address_reports(true);
+    transport.receive_observed_address_reports(true);
+    Arc::new(transport)
+}
+
+#[tokio::test]
+async fn connection_adds_a_direct_path_next_to_the_relayed_one() {
+    use n0_future::StreamExt;
+
+    let server = spawn_relay(Duration::from_secs(30)).await;
+    let (mut server_config, mut client_config) = quic_configs();
+    server_config.transport_config(traversal_transport());
+    client_config.transport_config(traversal_transport());
+
+    // Both ends are on relay sockets. Bob is dialed at his address at the relay.
+    let bob = bob(server_config);
+    let link = bob.connect_relay(&server, "bob");
+    let public_addr = timeout(TIMEOUT, link.public_addr()).await.unwrap().unwrap();
+    let alice = {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let runtime = Arc::new(TokioRuntime);
+        let inner = runtime.wrap_udp_socket(socket).unwrap();
+        let (socket, _handle) = RelaySocket::new(inner).unwrap();
+        let endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            Box::new(socket),
+            runtime,
+        )
+        .unwrap();
+        endpoint.set_default_client_config(client_config);
+        endpoint
+    };
+    let alice_local = PathAddr::from_socket_addr(alice.local_addr().unwrap());
+    let PathAddr::Direct(SocketAddr::V4(alice_local)) = alice_local else {
+        panic!("unexpected local address {alice_local:?}");
+    };
+    let alice_local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, alice_local.port());
+
+    let (alice_conn, bob_conn) = tokio::join!(
+        async {
+            alice
+                .connect(public_addr.into(), "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        bob.serve_one()
+    );
+    assert!(alice_conn.is_multipath_enabled());
+    assert!(PathAddr::from_socket_addr(remote_address(&bob_conn)).is_relayed());
+    echo(&alice_conn, b"through the relay").await;
+
+    // Each end tells the other where else it can be reached: at its real socket.
+    let mut alice_paths = alice_conn.path_events();
+    let direct = |addr: SocketAddrV4| PathAddr::Direct(addr.into()).to_socket_addr();
+    bob_conn
+        .add_nat_traversal_address(direct(bob.local_addr))
+        .unwrap();
+    alice_conn
+        .add_nat_traversal_address(direct(alice_local))
+        .unwrap();
+    // The dialer starts the round once it knows the other end's address.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let known = alice_conn.get_remote_nat_traversal_addresses().unwrap();
+        if !known.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the address was not advertised"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let probing = alice_conn.initiate_nat_traversal_round().unwrap();
+    assert!(!probing.is_empty());
+
+    // A second path comes up, directly between the two sockets.
+    let new_path = timeout(TIMEOUT, async {
+        loop {
+            match alice_paths.next().await {
+                Some(Ok(noq::PathEvent::Established { id, .. })) if id != noq::PathId::ZERO => {
+                    break id;
+                }
+                Some(_) => continue,
+                None => panic!("the connection closed"),
+            }
+        }
+    })
+    .await
+    .expect("no direct path was established");
+    let remote = alice_conn.path(new_path).unwrap().remote_address().unwrap();
+    assert_eq!(
+        PathAddr::from_socket_addr(remote),
+        PathAddr::Direct(bob.local_addr.into())
+    );
+
+    // Bob sees the same path from his end.
+    let bob_direct = timeout(TIMEOUT, async {
+        loop {
+            if let Some(path) = bob_conn.path(new_path)
+                && path.remote_address().is_ok()
+            {
+                break path;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the direct path did not come up at the other end");
+    assert_eq!(
+        PathAddr::from_socket_addr(bob_direct.remote_address().unwrap()),
+        PathAddr::Direct(alice_local.into())
+    );
+
+    // Bob closes the relayed path. Only he knows which one that is: to the dialer the
+    // address she dialed is an address like any other. What follows goes the direct way.
+    bob_conn.path(noq::PathId::ZERO).unwrap().close().unwrap();
+    let before = server.metrics().server.packets_inbound.get();
+    let large: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+    echo(&alice_conn, &large).await;
+    let through_relay = server.metrics().server.packets_inbound.get() - before;
+    assert!(
+        through_relay < 20,
+        "{through_relay} packets still went through the relay"
+    );
+
+    // The connection outlives the relay: with the link gone only the direct path is left.
+    drop(link);
+    let relay = server.relay().unwrap();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while relay.allocation_count() != 0 && relay.port_of(&bob_id()).is_some() {
+        // The port stays reserved for a while. What matters is that nobody serves it.
+        if !relay.disconnect(&bob_id()) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "link not closed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    echo(&alice_conn, &large).await;
+    echo(&alice_conn, b"without the relay").await;
+}
