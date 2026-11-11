@@ -61,7 +61,10 @@ pub use self::{
     auth::{AuthRequest, Authenticator, DynAuthenticator, Rejected, SharedTokenAuthenticator},
     http_server::{Handlers, RelayService},
     metrics::{Metrics, RelayMetrics},
-    policy::{AllocationPolicy, Direction, ForwardAll, Packet, TrafficPolicy, Verdict},
+    policy::{
+        AllocationPolicy, DefaultPolicy, DefaultPolicyConfig, Direction, ForwardAll, Packet,
+        RateLimit, TrafficPolicy, Verdict,
+    },
     relay::{AllocationConfig, ControlConnection, InvalidConfig, Relay},
     resolver::{DEFAULT_CERT_RELOAD_INTERVAL, reloading_resolver},
 };

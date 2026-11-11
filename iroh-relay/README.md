@@ -70,9 +70,44 @@ takes precedence over the config file.
 To authenticate clients differently, embed the relay as a library and
 implement `iroh_relay::server::Authenticator`. It receives the credentials
 the client presented and a value bound to the TLS session of the control
-channel, and returns the identity of the client. The same goes for
-`TrafficPolicy`, which decides which packets are forwarded. The binary
-forwards every packet.
+channel, and returns the identity of the client.
+
+### Traffic policy
+
+The relay carries traffic for strangers in both directions, and limits both:
+
+- A client may only send to addresses that recently sent to its port, so it
+  can not use the relay as a general UDP proxy.
+- The first packet from a new address must look like the start of a QUIC
+  connection: a long header packet of at least 1200 bytes.
+- The bytes forwarded per client are limited in each direction.
+
+```toml
+[allocations.policy]
+# For how long after an address last sent to a client's port the client may
+# send to it. Defaults to 120.
+# reply_window_secs = 120
+# How many addresses are tracked per client. Defaults to 1024.
+# max_remotes = 1024
+# Whether the first packet from a new address must look like the start of a
+# QUIC connection. Defaults to true.
+# require_initial = true
+# Rate limits in bytes per second, 0 for unlimited. Default to 2097152.
+# inbound_bytes_per_second = 2097152
+# outbound_bytes_per_second = 2097152
+# How many bytes may pass at once after a quiet period. Default to one
+# second's worth.
+# inbound_burst_bytes = 2097152
+# outbound_burst_bytes = 2097152
+```
+
+With `require_initial`, a dialer whose address changes in the middle of a
+connection, for example because its NAT rebinds, can not continue the
+connection through the relay and has to connect again. Turn it off if that
+matters more to you than making floods from spoofed addresses more expensive.
+
+To apply a different policy, embed the relay as a library and implement
+`iroh_relay::server::TrafficPolicy`.
 
 ## Local testing
 

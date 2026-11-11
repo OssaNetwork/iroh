@@ -5,6 +5,7 @@
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -178,6 +179,90 @@ struct AllocationsConfig {
     /// Must contain at least one non-empty token.
     #[serde(default)]
     shared_tokens: Vec<String>,
+    /// Which packets are forwarded. The defaults apply if not present.
+    #[serde(default)]
+    policy: PolicyConfig,
+}
+
+/// Configuration of which packets are forwarded for a client.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyConfig {
+    /// For how many seconds after a remote party last sent to a client's port the client
+    /// may send to it. Defaults to 120.
+    reply_window_secs: Option<u64>,
+    /// How many remote parties are tracked per client. Defaults to 1024.
+    max_remotes: Option<usize>,
+    /// Whether the first packet of a remote party must look like the start of a QUIC
+    /// connection. Defaults to `true`.
+    require_initial: Option<bool>,
+    /// The limit on bytes per second forwarded to a client. Defaults to 2097152 (2 MiB).
+    /// With 0 the rate is not limited.
+    inbound_bytes_per_second: Option<u64>,
+    /// How many bytes may be forwarded to a client at once after a quiet period.
+    /// Defaults to one second's worth.
+    inbound_burst_bytes: Option<u64>,
+    /// The limit on bytes per second forwarded from a client. Defaults to 2097152
+    /// (2 MiB). With 0 the rate is not limited.
+    outbound_bytes_per_second: Option<u64>,
+    /// How many bytes may be forwarded from a client at once after a quiet period.
+    /// Defaults to one second's worth.
+    outbound_burst_bytes: Option<u64>,
+}
+
+impl PolicyConfig {
+    fn into_policy_config(self) -> Result<relay::DefaultPolicyConfig> {
+        fn rate_limit(
+            name: &str,
+            bytes_per_second: Option<u64>,
+            burst_bytes: Option<u64>,
+            default: Option<relay::RateLimit>,
+        ) -> Result<Option<relay::RateLimit>> {
+            let limit = match bytes_per_second {
+                None => default,
+                Some(bytes_per_second) => {
+                    NonZeroU64::new(bytes_per_second).map(relay::RateLimit::new)
+                }
+            };
+            match (limit, burst_bytes) {
+                (Some(mut limit), Some(burst_bytes)) => {
+                    limit.burst_bytes = burst_bytes;
+                    Ok(Some(limit))
+                }
+                (None, Some(_)) => bail_any!(
+                    "allocations.policy: {name}_burst_bytes is set but the rate is unlimited"
+                ),
+                (limit, None) => Ok(limit),
+            }
+        }
+
+        let mut config = relay::DefaultPolicyConfig::default();
+        if let Some(secs) = self.reply_window_secs {
+            config.reply_window = Duration::from_secs(secs);
+        }
+        if let Some(max_remotes) = self.max_remotes {
+            if max_remotes == 0 {
+                bail_any!("allocations.policy: max_remotes must not be 0");
+            }
+            config.max_remotes = max_remotes;
+        }
+        if let Some(require_initial) = self.require_initial {
+            config.require_initial = require_initial;
+        }
+        config.inbound = rate_limit(
+            "inbound",
+            self.inbound_bytes_per_second,
+            self.inbound_burst_bytes,
+            config.inbound,
+        )?;
+        config.outbound = rate_limit(
+            "outbound",
+            self.outbound_bytes_per_second,
+            self.outbound_burst_bytes,
+            config.outbound,
+        )?;
+        Ok(config)
+    }
 }
 
 impl AllocationsConfig {
@@ -205,10 +290,11 @@ impl AllocationsConfig {
             bail_any!("allocations: invalid max_packet_size {max_packet_size}");
         }
 
+        let policy = relay::DefaultPolicy::new(self.policy.into_policy_config()?);
         let mut config = relay::AllocationConfig::new(
             self.public_ip,
             Arc::new(relay::SharedTokenAuthenticator::new(tokens)),
-            Arc::new(relay::ForwardAll),
+            Arc::new(policy),
         );
         config.bind_ip = self.bind_ip.unwrap_or(self.public_ip);
         config.ports = start..=end;
@@ -678,6 +764,49 @@ mod tests {
                 "config must be rejected: {invalid}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_policy_config() -> Result {
+        let parse = |policy: &str| -> Result<relay::DefaultPolicyConfig> {
+            let config = Config::from_str(&format!(
+                "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"t\"]\n{policy}"
+            ))?;
+            config
+                .allocations
+                .expect("allocations")
+                .policy
+                .into_policy_config()
+        };
+
+        assert_eq!(parse("")?, relay::DefaultPolicyConfig::default());
+
+        let config = parse(
+            r#"
+            [allocations.policy]
+            reply_window_secs = 60
+            max_remotes = 16
+            require_initial = false
+            inbound_bytes_per_second = 1000000
+            inbound_burst_bytes = 500000
+            outbound_bytes_per_second = 0
+        "#,
+        )?;
+        assert_eq!(config.reply_window, Duration::from_secs(60));
+        assert_eq!(config.max_remotes, 16);
+        assert!(!config.require_initial);
+        let inbound = config.inbound.expect("inbound limit");
+        assert_eq!(inbound.bytes_per_second.get(), 1_000_000);
+        assert_eq!(inbound.burst_bytes, 500_000);
+        assert_eq!(config.outbound, None);
+
+        assert!(parse("[allocations.policy]\nmax_remotes = 0").is_err());
+        assert!(
+            parse("[allocations.policy]\noutbound_bytes_per_second = 0\noutbound_burst_bytes = 9")
+                .is_err()
+        );
+        assert!(parse("[allocations.policy]\nunknown = 1").is_err());
         Ok(())
     }
 

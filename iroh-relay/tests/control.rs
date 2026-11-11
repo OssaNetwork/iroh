@@ -19,8 +19,8 @@ use iroh_relay::{
         DhtStatus, ErrorCode, MAX_FRAME_SIZE, RelayControl, RelayFrame, RemoteAddr,
     },
     server::{
-        AllocationConfig, AuthRequest, Authenticator, ClientId, ForwardAll, Rejected, Server,
-        ServerConfig, SharedTokenAuthenticator, testing,
+        AllocationConfig, AuthRequest, Authenticator, ClientId, DefaultPolicy, ForwardAll,
+        Rejected, Server, ServerConfig, SharedTokenAuthenticator, testing,
     },
     tls::make_dangerous_client_config,
 };
@@ -524,6 +524,52 @@ async fn channel_binding_matches_on_both_ends() {
     )
     .await;
     expect_error(&mut other, ErrorCode::Unauthorized).await;
+}
+
+#[tokio::test]
+async fn default_policy_only_lets_the_client_reply() {
+    let mut config = allocations(Duration::from_secs(30));
+    config.policy = Arc::new(DefaultPolicy::default());
+    let server = spawn_relay(config).await;
+    let (mut bob, bob_addr) = connect(&server, "bob").await;
+    let (alice, alice_addr) = udp_socket().await;
+    let (mallory, mallory_addr) = udp_socket().await;
+    let dropped = || server.metrics().server.packets_dropped_policy.get();
+    let to = |addr| Datagram {
+        remote: RemoteAddr::udp(addr),
+        payload: Bytes::from_static(b"hello"),
+    };
+
+    // Bob can not send to an address that never sent to him.
+    send(&mut bob, to(alice_addr)).await;
+    eventually("the unsolicited packet is dropped", || dropped() == 1).await;
+
+    // A first packet that is not a QUIC Initial is dropped.
+    alice.send_to(b"not quic", bob_addr).await.unwrap();
+    eventually("the non-QUIC packet is dropped", || dropped() == 2).await;
+
+    // A QUIC Initial of at least 1200 bytes opens the way in both directions.
+    let mut initial = vec![0u8; 1200];
+    initial[0] = 0xc0;
+    initial[4] = 1;
+    alice.send_to(&initial, bob_addr).await.unwrap();
+    let datagram = recv_datagram(&mut bob).await;
+    assert_eq!(datagram.remote, RemoteAddr::udp(alice_addr));
+    assert_eq!(datagram.payload, Bytes::from(initial));
+
+    send(&mut bob, to(alice_addr)).await;
+    let (payload, _) = recv_udp(&alice).await;
+    assert_eq!(payload, b"hello");
+    // Short packets pass once the address is known.
+    alice.send_to(b"short", bob_addr).await.unwrap();
+    assert_eq!(&recv_datagram(&mut bob).await.payload[..], b"short");
+
+    // Still nothing goes to anybody else.
+    send(&mut bob, to(mallory_addr)).await;
+    eventually("the unsolicited packet is dropped", || dropped() == 3).await;
+    send(&mut bob, to(alice_addr)).await;
+    recv_udp(&alice).await;
+    assert!(mallory.try_recv_from(&mut [0u8; 16]).is_err());
 }
 
 #[tokio::test]
