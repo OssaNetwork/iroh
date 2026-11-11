@@ -20,16 +20,20 @@
 //! candidates follow in port order. A client that returns after its release timeout has
 //! passed therefore usually gets its previous port back, as long as no other client has
 //! taken it, without the relay remembering anything about the client.
+//!
+//! This is best effort. The hash is not keyed, so anyone who knows an identity can work
+//! out its preferred port and take it while the client is away. What protects the client
+//! is that dialers verify its identity end to end, not that it keeps its port.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::RangeInclusive,
     time::Duration,
 };
 
 use bytes::Bytes;
-use n0_error::stack_error;
+use n0_error::{ensure, stack_error};
 use n0_future::time::Instant;
 
 /// The default time a port stays reserved for its client after the control channel closed.
@@ -41,11 +45,15 @@ pub const DEFAULT_PORT_RANGE: RangeInclusive<u16> = 1024..=65535;
 /// How long a port that could not be bound is skipped.
 const UNUSABLE_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// The longest a port is held. Longer release timeouts are clamped to this, which keeps
+/// deadlines representable.
+const MAX_RELEASE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
 /// The identity of a client, as established by the relay's authenticator.
 ///
 /// The relay treats the identity as opaque bytes. It is used to recognise a returning
 /// client and as the key for policies and logs.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ClientId(Bytes);
 
 impl ClientId {
@@ -80,6 +88,31 @@ impl fmt::Debug for ClientId {
 #[stack_error(derive, add_meta)]
 #[error("no port is available")]
 pub struct NoPortAvailable {}
+
+/// The port range of a [`PortAllocator`] is not usable.
+#[stack_error(derive, add_meta)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum InvalidPortRange {
+    #[error("port range {start}..={end} is empty")]
+    Empty { start: u16, end: u16 },
+    #[error("port 0 can not be handed out")]
+    ContainsZero,
+}
+
+/// What [`PortAllocator::release`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Released {
+    /// The port stays reserved for the identity until the deadline, at which
+    /// [`PortAllocator::expire`] frees it. Keep the port's socket until then.
+    Held(Instant),
+    /// The port is free again, because the release timeout is zero. Close the port's
+    /// socket.
+    Freed,
+    /// Nothing changed, because the generation is not the identity's current one. The
+    /// port, if any, belongs to a newer acquisition. Leave its socket alone.
+    Stale,
+}
 
 /// A port handed to a client by [`PortAllocator::acquire`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +154,8 @@ pub struct PortAllocator {
     by_port: HashMap<u16, ClientId>,
     /// Ports that could not be bound, and until when they are skipped.
     unusable: HashMap<u16, Instant>,
+    /// Ports that are never handed out.
+    excluded: HashSet<u16>,
     /// The held ports ordered by the time their release timeout passes.
     held: BTreeMap<(Instant, u16), ClientId>,
     next_generation: u64,
@@ -131,16 +166,36 @@ impl PortAllocator {
     ///
     /// A released port stays reserved for its identity for `release_timeout`. With a zero
     /// timeout ports are freed as soon as they are released.
-    pub fn new(range: RangeInclusive<u16>, release_timeout: Duration) -> Self {
-        Self {
+    pub fn new(
+        range: RangeInclusive<u16>,
+        release_timeout: Duration,
+    ) -> Result<Self, InvalidPortRange> {
+        ensure!(
+            range.start() <= range.end(),
+            InvalidPortRange::Empty {
+                start: *range.start(),
+                end: *range.end()
+            }
+        );
+        ensure!(*range.start() != 0, InvalidPortRange::ContainsZero);
+        Ok(Self {
             range,
-            release_timeout,
+            release_timeout: release_timeout.min(MAX_RELEASE_TIMEOUT),
             by_identity: HashMap::new(),
             by_port: HashMap::new(),
             unusable: HashMap::new(),
+            excluded: HashSet::new(),
             held: BTreeMap::new(),
             next_generation: 0,
-        }
+        })
+    }
+
+    /// Never hands out `port`.
+    ///
+    /// Use this for ports in the range that the relay itself listens on. Has no effect on
+    /// a port that is already owned.
+    pub fn exclude_port(&mut self, port: u16) {
+        self.excluded.insert(port);
     }
 
     /// Returns the time a released port stays reserved for its identity.
@@ -174,9 +229,14 @@ impl PortAllocator {
     /// is returned again with a new [`Lease::generation`]. Otherwise a free port is
     /// chosen.
     ///
-    /// Ports whose release timeout has passed by `now` are not freed here, call
-    /// [`Self::expire`] first.
+    /// Call [`Self::expire`] with the same `now` first. A hold whose release timeout has
+    /// passed but that was not expired yet is resumed like any other hold, while the
+    /// caller may already have given up on it.
     pub fn acquire(&mut self, identity: &ClientId, now: Instant) -> Result<Lease, NoPortAvailable> {
+        debug_assert!(
+            self.next_expiry().is_none_or(|until| until > now),
+            "expire must be called before acquire"
+        );
         let generation = self.next_generation;
         self.next_generation += 1;
 
@@ -192,8 +252,9 @@ impl PortAllocator {
             });
         }
 
-        self.unusable.retain(|_, until| *until > now);
-        let port = self.find_free(identity).ok_or_else(NoPortAvailable::new)?;
+        let port = self
+            .find_free(identity, now)
+            .ok_or_else(NoPortAvailable::new)?;
         self.by_port.insert(port, identity.clone());
         self.by_identity.insert(
             identity.clone(),
@@ -211,34 +272,31 @@ impl PortAllocator {
 
     /// Releases the port of `identity` after its control channel closed.
     ///
-    /// The port stays reserved for the identity until the returned deadline, at which
-    /// [`Self::expire`] frees it. Returns `None` if nothing is held: because `generation`
-    /// is not the identity's current one, or because the release timeout is zero and the
-    /// port was freed right away.
-    pub fn release(
-        &mut self,
-        identity: &ClientId,
-        generation: u64,
-        now: Instant,
-    ) -> Option<Instant> {
-        let entry = self.by_identity.get_mut(identity)?;
+    /// See [`Released`] for the possible outcomes and what to do with the port's socket.
+    pub fn release(&mut self, identity: &ClientId, generation: u64, now: Instant) -> Released {
+        let Some(entry) = self.by_identity.get_mut(identity) else {
+            return Released::Stale;
+        };
         if entry.state != (State::Active { generation }) {
-            return None;
+            return Released::Stale;
         }
         if self.release_timeout.is_zero() {
             self.remove(identity);
-            return None;
+            return Released::Freed;
         }
         let until = now + self.release_timeout;
         entry.state = State::Held { until };
         self.held.insert((until, entry.port), identity.clone());
-        Some(until)
+        Released::Held(until)
     }
 
     /// Frees the port of `identity` because it could not be bound.
     ///
     /// The port is skipped for a while when choosing ports. Does nothing if `generation`
     /// is not the identity's current one.
+    ///
+    /// Only call this for a [`Lease`] that was not [resumed](Lease::resumed). A resumed
+    /// port already has a socket, binding it again fails for that reason alone.
     pub fn mark_unusable(&mut self, identity: &ClientId, generation: u64, now: Instant) {
         let Some(entry) = self.by_identity.get(identity) else {
             return;
@@ -246,8 +304,10 @@ impl PortAllocator {
         if entry.state != (State::Active { generation }) {
             return;
         }
-        self.unusable.insert(entry.port, now + UNUSABLE_COOLDOWN);
+        let port = entry.port;
         self.remove(identity);
+        self.unusable.retain(|_, until| *until > now);
+        self.unusable.insert(port, now + UNUSABLE_COOLDOWN);
     }
 
     /// Frees all ports whose release timeout has passed by `now`.
@@ -260,9 +320,8 @@ impl PortAllocator {
             if until > now {
                 break;
             }
-            let identity = entry.remove();
-            self.by_identity.remove(&identity);
-            self.by_port.remove(&port);
+            let identity = entry.get().clone();
+            self.remove(&identity);
             expired.push((identity, port));
         }
         expired
@@ -283,17 +342,22 @@ impl PortAllocator {
     }
 
     /// Finds a free port, starting at the preferred port of `identity`.
-    fn find_free(&self, identity: &ClientId) -> Option<u16> {
+    fn find_free(&self, identity: &ClientId, now: Instant) -> Option<u16> {
         let start = u32::from(*self.range.start());
         let end = u32::from(*self.range.end());
-        if start > end {
+        let count = end - start + 1;
+        // Every port is owned, no need to look at each of them.
+        if self.by_port.len() >= count as usize {
             return None;
         }
-        let count = end - start + 1;
         let preferred = (stable_hash(identity.as_bytes()) % u64::from(count)) as u32;
         (0..count)
             .map(|offset| (start + (preferred + offset) % count) as u16)
-            .find(|port| !self.by_port.contains_key(port) && !self.unusable.contains_key(port))
+            .find(|port| {
+                !self.by_port.contains_key(port)
+                    && !self.excluded.contains(port)
+                    && self.unusable.get(port).is_none_or(|until| *until <= now)
+            })
     }
 }
 
@@ -323,8 +387,8 @@ mod tests {
     #[test]
     fn preferred_port_is_stable() {
         let now = Instant::now();
-        let mut a = PortAllocator::new(DEFAULT_PORT_RANGE, TIMEOUT);
-        let mut b = PortAllocator::new(DEFAULT_PORT_RANGE, TIMEOUT);
+        let mut a = PortAllocator::new(DEFAULT_PORT_RANGE, TIMEOUT).unwrap();
+        let mut b = PortAllocator::new(DEFAULT_PORT_RANGE, TIMEOUT).unwrap();
         let port = a.acquire(&id("bob"), now).unwrap().port;
         assert_eq!(b.acquire(&id("bob"), now).unwrap().port, port);
         assert!(DEFAULT_PORT_RANGE.contains(&port));
@@ -335,7 +399,7 @@ mod tests {
     #[test]
     fn probes_forward_and_wraps() {
         let now = Instant::now();
-        let mut alloc = PortAllocator::new(1000..=1003, TIMEOUT);
+        let mut alloc = PortAllocator::new(1000..=1003, TIMEOUT).unwrap();
         let mut ports = Vec::new();
         for i in 0..4 {
             let lease = alloc.acquire(&id(&format!("client-{i}")), now).unwrap();
@@ -349,19 +413,46 @@ mod tests {
     }
 
     #[test]
-    fn empty_range() {
+    fn rejects_unusable_ranges() {
         #[allow(clippy::reversed_empty_ranges)]
-        let mut alloc = PortAllocator::new(2000..=1000, TIMEOUT);
-        assert!(alloc.acquire(&id("bob"), Instant::now()).is_err());
+        let res = PortAllocator::new(2000..=1000, TIMEOUT);
+        assert!(matches!(res, Err(InvalidPortRange::Empty { .. })));
+        let res = PortAllocator::new(0..=1000, TIMEOUT);
+        assert!(matches!(res, Err(InvalidPortRange::ContainsZero { .. })));
+    }
+
+    #[test]
+    fn excluded_ports_are_never_handed_out() {
+        let now = Instant::now();
+        let mut alloc = PortAllocator::new(1000..=1002, TIMEOUT).unwrap();
+        alloc.exclude_port(1000);
+        alloc.exclude_port(1002);
+        assert_eq!(alloc.acquire(&id("bob"), now).unwrap().port, 1001);
+        assert!(alloc.acquire(&id("carol"), now).is_err());
+    }
+
+    #[test]
+    fn huge_release_timeout_does_not_overflow() {
+        let now = Instant::now();
+        let mut alloc = PortAllocator::new(1000..=1000, Duration::MAX).unwrap();
+        let lease = alloc.acquire(&id("bob"), now).unwrap();
+        assert!(matches!(
+            alloc.release(&id("bob"), lease.generation, now),
+            Released::Held(_)
+        ));
+        assert!(alloc.expire(now + Duration::from_secs(3600)).is_empty());
     }
 
     #[test]
     fn held_port_is_resumed_within_timeout() {
         let now = Instant::now();
-        let mut alloc = PortAllocator::new(1000..=1001, TIMEOUT);
+        let mut alloc = PortAllocator::new(1000..=1001, TIMEOUT).unwrap();
         let lease = alloc.acquire(&id("bob"), now).unwrap();
-        let until = alloc.release(&id("bob"), lease.generation, now).unwrap();
-        assert_eq!(until, now + TIMEOUT);
+        let until = now + TIMEOUT;
+        assert_eq!(
+            alloc.release(&id("bob"), lease.generation, now),
+            Released::Held(until)
+        );
         assert_eq!(alloc.next_expiry(), Some(until));
 
         // The held port still counts as taken.
@@ -384,9 +475,10 @@ mod tests {
     #[test]
     fn held_port_is_freed_after_timeout() {
         let now = Instant::now();
-        let mut alloc = PortAllocator::new(1000..=1000, TIMEOUT);
+        let mut alloc = PortAllocator::new(1000..=1000, TIMEOUT).unwrap();
         let lease = alloc.acquire(&id("bob"), now).unwrap();
-        let until = alloc.release(&id("bob"), lease.generation, now).unwrap();
+        let until = now + TIMEOUT;
+        alloc.release(&id("bob"), lease.generation, now);
 
         assert_eq!(alloc.expire(until), vec![(id("bob"), 1000)]);
         assert!(alloc.is_empty());
@@ -402,9 +494,12 @@ mod tests {
     #[test]
     fn zero_timeout_frees_immediately() {
         let now = Instant::now();
-        let mut alloc = PortAllocator::new(1000..=1000, Duration::ZERO);
+        let mut alloc = PortAllocator::new(1000..=1000, Duration::ZERO).unwrap();
         let lease = alloc.acquire(&id("bob"), now).unwrap();
-        assert_eq!(alloc.release(&id("bob"), lease.generation, now), None);
+        assert_eq!(
+            alloc.release(&id("bob"), lease.generation, now),
+            Released::Freed
+        );
         assert!(alloc.is_empty());
         assert!(alloc.acquire(&id("carol"), now).is_ok());
     }
@@ -412,7 +507,7 @@ mod tests {
     #[test]
     fn takeover_ignores_the_stale_release() {
         let now = Instant::now();
-        let mut alloc = PortAllocator::new(1000..=1010, TIMEOUT);
+        let mut alloc = PortAllocator::new(1000..=1010, TIMEOUT).unwrap();
         let first = alloc.acquire(&id("bob"), now).unwrap();
         // A second control channel for the same identity takes over.
         let second = alloc.acquire(&id("bob"), now).unwrap();
@@ -420,17 +515,26 @@ mod tests {
         assert_eq!(second.port, first.port);
 
         // The first channel closing must not release the port.
-        assert_eq!(alloc.release(&id("bob"), first.generation, now), None);
+        assert_eq!(
+            alloc.release(&id("bob"), first.generation, now),
+            Released::Stale
+        );
         assert_eq!(alloc.next_expiry(), None);
-        assert!(alloc.release(&id("bob"), second.generation, now).is_some());
+        assert!(matches!(
+            alloc.release(&id("bob"), second.generation, now),
+            Released::Held(_)
+        ));
         // Releasing twice is harmless.
-        assert_eq!(alloc.release(&id("bob"), second.generation, now), None);
+        assert_eq!(
+            alloc.release(&id("bob"), second.generation, now),
+            Released::Stale
+        );
     }
 
     #[test]
     fn unusable_port_is_skipped_for_a_while() {
         let now = Instant::now();
-        let mut alloc = PortAllocator::new(1000..=1001, TIMEOUT);
+        let mut alloc = PortAllocator::new(1000..=1001, TIMEOUT).unwrap();
         let first = alloc.acquire(&id("bob"), now).unwrap();
         alloc.mark_unusable(&id("bob"), first.generation, now);
         assert!(alloc.is_empty());
@@ -448,7 +552,7 @@ mod tests {
     #[test]
     fn expires_in_deadline_order() {
         let now = Instant::now();
-        let mut alloc = PortAllocator::new(1000..=1010, TIMEOUT);
+        let mut alloc = PortAllocator::new(1000..=1010, TIMEOUT).unwrap();
         let bob = alloc.acquire(&id("bob"), now).unwrap();
         let carol = alloc.acquire(&id("carol"), now).unwrap();
         let later = now + Duration::from_secs(10);
