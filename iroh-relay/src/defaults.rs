@@ -33,8 +33,6 @@ pub mod timeouts {
     /// before starting to connect, so the preference is honored.
     pub(crate) const RESOLUTION_DELAY: Duration = Duration::from_millis(50);
 
-    /// Default timeout for DNS queries issued by [`DnsResolver`].
-    ///
-    /// [`DnsResolver`]: iroh_dns::dns::DnsResolver
+    /// Default timeout for resolving a host name.
     pub(crate) const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 }

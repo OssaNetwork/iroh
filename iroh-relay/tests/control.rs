@@ -10,7 +10,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use iroh_dns::dns::DnsResolver;
 use iroh_relay::{
     auth::{CHANNEL_BINDING_LEN, SharedToken, channel_binding},
     client::{WsConnection, WsDialer},
@@ -70,7 +69,7 @@ async fn open(server: &Server) -> WsConnection {
     let url = format!("https://{}", server.https_addr().unwrap())
         .parse()
         .unwrap();
-    WsDialer::new(url, DnsResolver::new(), MAX_FRAME_SIZE)
+    WsDialer::new(url, MAX_FRAME_SIZE)
         .tls_client_config(make_dangerous_client_config())
         .connect(CONTROL_RELATIVE_PATH, CONTROL_SUBPROTOCOL)
         .await

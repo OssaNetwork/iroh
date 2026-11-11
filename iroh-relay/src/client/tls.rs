@@ -32,21 +32,17 @@ use crate::defaults::timeouts::*;
 #[derive(Debug, Clone)]
 pub(super) struct MaybeTlsStreamBuilder {
     url: Url,
-    dns_resolver: DnsResolver,
+    resolver: HostResolver,
     proxy_url: Option<Url>,
     prefer_ipv6: bool,
     tls_config: rustls::ClientConfig,
 }
 
 impl MaybeTlsStreamBuilder {
-    pub(super) fn new(
-        url: Url,
-        dns_resolver: DnsResolver,
-        tls_config: rustls::ClientConfig,
-    ) -> Self {
+    pub(super) fn new(url: Url, resolver: HostResolver, tls_config: rustls::ClientConfig) -> Self {
         Self {
             url,
-            dns_resolver,
+            resolver,
             proxy_url: None,
             prefer_ipv6: false,
             tls_config,
@@ -119,8 +115,7 @@ impl MaybeTlsStreamBuilder {
             let stream = self.dial_url_proxy(proxy.clone(), tls_connector).await?;
             Ok(ProxyStream::Proxied(stream))
         } else {
-            let stream =
-                dial_happy_eyeballs(&self.dns_resolver, &self.url, self.prefer_ipv6).await?;
+            let stream = dial_happy_eyeballs(&self.resolver, &self.url, self.prefer_ipv6).await?;
             Ok(ProxyStream::Raw(stream))
         }
     }
@@ -133,7 +128,7 @@ impl MaybeTlsStreamBuilder {
     {
         debug!(%self.url, proxy_url = %with_password_masked(&proxy_url), "dial url via proxy");
 
-        let tcp_stream = dial_happy_eyeballs(&self.dns_resolver, &proxy_url, self.prefer_ipv6)
+        let tcp_stream = dial_happy_eyeballs(&self.resolver, &proxy_url, self.prefer_ipv6)
             .await
             .map_err(|err| match err {
                 DialError::InvalidTargetPort { meta } => DialError::ProxyInvalidTargetPort { meta },
@@ -248,15 +243,14 @@ impl MaybeTlsStreamBuilder {
 /// The first connection to succeed is returned; the rest are dropped, which
 /// cancels them.
 async fn dial_happy_eyeballs(
-    dns_resolver: &DnsResolver,
+    resolver: &HostResolver,
     url: &Url,
     prefer_ipv6: bool,
 ) -> Result<TcpStream, DialError> {
     let port = url_port(url).ok_or_else(|| e!(DialError::InvalidTargetPort))?;
 
     // Stream of resolved addresses.
-    let resolve_stream = dns_resolver.resolve_host_all(url, DNS_TIMEOUT);
-    tokio::pin!(resolve_stream);
+    let mut resolve_stream = resolver.resolve_all(url, DNS_TIMEOUT);
     // Set to `true` once `resolve_stream` yielded `None`, to not poll it again after completion.
     let mut resolve_stream_finished = false;
     // Addresses resolved but not yet tried, in arrival order.
@@ -276,7 +270,7 @@ async fn dial_happy_eyeballs(
     loop {
         if resolve_stream_finished && queue.is_empty() && dials.is_empty() {
             // Nothing left to resolve, attempt, or wait on.
-            return Err(last_err.unwrap_or_else(|| e!(DnsError::NoResponse).into()));
+            return Err(last_err.unwrap_or_else(|| e!(ResolveError::NoAddresses).into()));
         }
 
         // The next dial is due and an address is waiting: dial the next address,
@@ -388,7 +382,8 @@ fn with_password_masked(url: &Url) -> Url {
     url
 }
 
-#[cfg(test)]
+// The tests resolve to addresses of their choosing, which takes a DNS resolver.
+#[cfg(all(test, feature = "dns"))]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -459,7 +454,7 @@ mod tests {
         let err = dial_happy_eyeballs(&resolver, &relay_url(80), false)
             .await
             .expect_err("no addresses to dial");
-        assert!(matches!(err, DialError::Dns { .. }));
+        assert!(matches!(err, DialError::Resolve { .. }));
     }
 
     /// Dials through a fake proxy with the given userinfo and returns the

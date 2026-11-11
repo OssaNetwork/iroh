@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use iroh_dns::dns::DnsResolver;
 use iroh_relay::{
     auth::SharedToken,
     client::{
@@ -147,8 +146,7 @@ impl TestRelay {
         let url = format!("https://{}", self.server.https_addr().unwrap())
             .parse()
             .unwrap();
-        WsDialer::new(url, DnsResolver::new(), MAX_FRAME_SIZE)
-            .tls_client_config(make_dangerous_client_config())
+        WsDialer::new(url, MAX_FRAME_SIZE).tls_client_config(make_dangerous_client_config())
     }
 
     /// The configuration of a tunnel to this relay. The relay does not listen on port

@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use iroh_dns::dns::DnsResolver;
 use iroh_relay::{
     auth::SharedToken,
     client::{DhtError, LinkState, RelayLink, RelaySocket, RelaySocketHandle, WsDialer},
@@ -98,8 +97,8 @@ async fn client(setup: &Setup, name: &str) -> Client {
     let url = format!("https://{}", setup.server.https_addr().unwrap())
         .parse()
         .unwrap();
-    let dialer = WsDialer::new(url, DnsResolver::new(), MAX_FRAME_SIZE)
-        .tls_client_config(make_dangerous_client_config());
+    let dialer =
+        WsDialer::new(url, MAX_FRAME_SIZE).tls_client_config(make_dangerous_client_config());
     let credentials = SharedToken::new(name.to_string(), TOKEN);
     let link = handle.connect_relay(dialer, Arc::new(credentials));
     let addr = timeout(TIMEOUT, link.public_addr()).await.unwrap().unwrap();

@@ -31,7 +31,7 @@ pub mod protos;
 pub mod quic;
 #[cfg(feature = "server")]
 pub mod server;
-#[cfg(test)]
+#[cfg(all(test, feature = "dns"))]
 pub(crate) mod test_utils;
 pub mod tls;
 

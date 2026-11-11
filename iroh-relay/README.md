@@ -17,6 +17,15 @@ provides:
   relays, and the connection to a relay behind it.
 - Server Binary: A CLI for running your own relay server.
 
+## Features of the crate
+
+- `server`: the relay server and its binary.
+- `dht`: the mainline DHT service of the server.
+- `dns` (default): lets the client resolve host names with a DNS resolver of
+  its own. Without it the client uses the resolver of the operating system
+  and the crate has fewer dependencies.
+- `tls-ring` (default) and `tls-aws-lc-rs`: the cryptography provider.
+
 ## Build the server
 
 You can build an optimised release of `iroh-relay` by running `cargo build`

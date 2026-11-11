@@ -1,6 +1,6 @@
 //! Client-side connection establishment to a relay server.
 //!
-//! - [`WsDialer`] opens a WebSocket to one of the relay's endpoints. It handles DNS
+//! - [`WsDialer`] opens a WebSocket to one of the relay's endpoints. It handles name
 //!   resolution, happy-eyeballs dialing, HTTP proxies and TLS.
 //! - [`RelaySocket`] is a UDP socket for a QUIC stack that is also reachable through
 //!   relays. A [`RelayLink`] connects it to one relay and keeps the connection open.
@@ -16,7 +16,6 @@ use std::{
 
 use bytes::Bytes;
 use http::header::SEC_WEBSOCKET_PROTOCOL;
-use iroh_dns::dns::{DnsError, DnsResolver};
 use n0_error::{AnyError, StdResultExt, e, stack_error};
 use n0_future::{Sink, Stream, time};
 use tracing::{debug, trace};
@@ -31,6 +30,7 @@ use crate::{
 mod addr;
 mod link;
 mod race;
+mod resolve;
 mod socket;
 pub(crate) mod streams;
 mod tls;
@@ -44,6 +44,7 @@ pub use self::{
         RelayLink,
     },
     race::{FallbackMemory, RaceError, TUNNEL_RACE_DELAY, Winner, race_udp_and_tunnel},
+    resolve::{HostResolver, ResolveError},
     socket::{RelaySocket, RelaySocketHandle},
     tunnel::{TunnelConfig, TunnelLink, TunnelState},
 };
@@ -108,7 +109,7 @@ pub enum DialError {
     #[error("Invalid target port")]
     InvalidTargetPort {},
     #[error(transparent)]
-    Dns { source: DnsError },
+    Resolve { source: ResolveError },
     #[error(transparent)]
     Timeout {
         #[error(std_err)]
@@ -146,7 +147,7 @@ pub struct WsDialer {
     tls_config: Option<rustls::ClientConfig>,
     /// HTTP Proxy
     proxy_url: Option<Url>,
-    dns_resolver: DnsResolver,
+    resolver: HostResolver,
     /// Maximum WebSocket payload length accepted from the server.
     max_payload_len: usize,
 }
@@ -156,15 +157,23 @@ impl WsDialer {
     ///
     /// `max_payload_len` bounds the size of a single WebSocket message accepted from the
     /// server.
-    pub fn new(url: Url, dns_resolver: DnsResolver, max_payload_len: usize) -> Self {
+    pub fn new(url: Url, max_payload_len: usize) -> Self {
         Self {
             address_family_selector: None,
             url,
             tls_config: None,
             proxy_url: None,
-            dns_resolver,
+            resolver: HostResolver::default(),
             max_payload_len,
         }
+    }
+
+    /// Sets how the host names of the relay and of the proxy are resolved.
+    ///
+    /// Defaults to the resolver of the operating system.
+    pub fn resolver(mut self, resolver: impl Into<HostResolver>) -> Self {
+        self.resolver = resolver.into();
+        self
     }
 
     /// Sets a custom TLS config.
@@ -254,13 +263,10 @@ impl WsDialer {
             .clone()
             .ok_or_else(|| e!(ConnectError::MissingCryptoProvider))?;
 
-        let builder = tls::MaybeTlsStreamBuilder::new(
-            dial_url.clone(),
-            self.dns_resolver.clone(),
-            tls_config,
-        )
-        .prefer_ipv6(self.prefer_ipv6())
-        .proxy_url(self.proxy_url.clone());
+        let builder =
+            tls::MaybeTlsStreamBuilder::new(dial_url.clone(), self.resolver.clone(), tls_config)
+                .prefer_ipv6(self.prefer_ipv6())
+                .proxy_url(self.proxy_url.clone());
 
         let stream = builder.connect().await?;
         let local_addr = stream

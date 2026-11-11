@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use iroh_dns::dns::DnsResolver;
 use iroh_relay::{
     auth::SharedToken,
     client::{LinkState, PathAddr, RelayLink, RelaySocket, RelaySocketHandle, WsDialer},
@@ -65,8 +64,7 @@ fn dialer(server: &Server) -> WsDialer {
     let url = format!("https://{}", server.https_addr().unwrap())
         .parse()
         .unwrap();
-    WsDialer::new(url, DnsResolver::new(), MAX_FRAME_SIZE)
-        .tls_client_config(make_dangerous_client_config())
+    WsDialer::new(url, MAX_FRAME_SIZE).tls_client_config(make_dangerous_client_config())
 }
 
 /// The TLS configuration of a QUIC endpoint with a self-signed certificate.

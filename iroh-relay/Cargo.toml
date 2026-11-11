@@ -26,8 +26,8 @@ derive_more = { version = "2.0.1", features = [
 http = "1"
 http-body-util = "0.1.0"
 hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = "0.1.5"
-iroh-dns = { version = "1.4.1", path = "../iroh-dns" }
+hyper-util = { version = "0.1.5", features = ["tokio"] }
+iroh-dns = { version = "1.4.1", path = "../iroh-dns", optional = true }
 iroh-metrics = { version = "1.0.2", default-features = false }
 n0-error = "1.0.0"
 n0-future = "0.3"
@@ -96,7 +96,10 @@ n0-tracing-test = "0.3"
 cfg_aliases = "0.2.2"
 
 [features]
-default = ["metrics", "tls-ring"]
+default = ["metrics", "tls-ring", "dns"]
+# Lets the client resolve host names with a DNS resolver of its own instead of the
+# operating system's.
+dns = ["dep:iroh-dns"]
 # Enables fetching TLS trust anchors from the operating system
 platform-verifier = ["dep:rustls-platform-verifier"]
 server = [
@@ -135,14 +138,14 @@ tls-ring = [
     "rustls/ring",
     "tokio-rustls/ring",
     "tokio-websockets/ring",
-    "iroh-dns/tls-ring",
+    "iroh-dns?/tls-ring",
 ]
 tls-aws-lc-rs = [
     "noq/aws-lc-rs",
     "rustls/aws-lc-rs",
     "tokio-rustls/aws-lc-rs",
     "tokio-websockets/aws_lc_rs",
-    "iroh-dns/tls-aws-lc-rs",
+    "iroh-dns?/tls-aws-lc-rs",
 ]
 
 [[test]]

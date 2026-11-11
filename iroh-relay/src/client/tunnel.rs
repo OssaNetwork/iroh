@@ -7,7 +7,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use iroh_dns::dns::DnsResolver;
 use n0_future::{SinkExt, StreamExt, time};
 
 use tokio::sync::{mpsc, watch};
@@ -15,7 +14,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, trace};
 use url::Url;
 
-use super::{WsConnection, WsDialer, addr::PathAddr, link::Inbound, socket::TunnelRegistration};
+use super::{
+    HostResolver, WsConnection, WsDialer, addr::PathAddr, link::Inbound, socket::TunnelRegistration,
+};
 use crate::protos::{
     relay::{MAX_TUNNEL_FRAME_SIZE, TUNNEL_RELATIVE_PATH_PREFIX, TUNNEL_SUBPROTOCOL},
     streams::write_batch,
@@ -51,20 +52,17 @@ pub struct TunnelConfig {
     /// An HTTP proxy to connect through.
     pub proxy_url: Option<Url>,
     /// Resolves the host of the proxy. The relay itself is addressed by IP.
-    pub dns_resolver: DnsResolver,
+    pub resolver: HostResolver,
 }
 
 impl TunnelConfig {
     /// Creates a configuration with the given TLS configuration.
-    ///
-    /// This sets up a DNS resolver. Create the configuration once and clone it for every
-    /// tunnel.
     pub fn new(tls_config: rustls::ClientConfig) -> Self {
         Self {
             tls_config,
             tcp_port: TUNNEL_TCP_PORT,
             proxy_url: None,
-            dns_resolver: DnsResolver::new(),
+            resolver: HostResolver::default(),
         }
     }
 }
@@ -237,8 +235,8 @@ impl Actor {
         // The relay is addressed by IP. Its certificate is verified against that IP.
         let url = format!("https://{}:{}/", self.target.ip(), self.config.tcp_port);
         let url = Url::parse(&url).map_err(|err| err.to_string())?;
-        let resolver = self.config.dns_resolver.clone();
-        let mut dialer = WsDialer::new(url, resolver, MAX_TUNNEL_FRAME_SIZE)
+        let mut dialer = WsDialer::new(url, MAX_TUNNEL_FRAME_SIZE)
+            .resolver(self.config.resolver.clone())
             .tls_client_config(self.config.tls_config.clone());
         if let Some(proxy_url) = &self.config.proxy_url {
             dialer = dialer.proxy_url(proxy_url.clone());
