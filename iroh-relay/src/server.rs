@@ -11,6 +11,7 @@
 //!
 //! The relay server hosts the following services:
 //!
+//! - HTTPS `/control`: The control channel of a client, see [`relay`].
 //! - HTTPS `/ping`: Used for net_report probes.
 //! - HTTPS `/generate_204`: Used for net_report probes.
 
@@ -45,17 +46,23 @@ use crate::{
 };
 
 pub mod allocator;
+pub mod auth;
 pub mod http_server;
 mod metrics;
+pub mod policy;
+pub mod relay;
 pub(crate) mod resolver;
 pub mod streams;
 #[cfg(feature = "test-utils")]
 pub mod testing;
 
 pub use self::{
-    allocator::{ClientId, PortAllocator},
+    allocator::{ClientId, InvalidPortRange, PortAllocator},
+    auth::{AuthRequest, Authenticator, DynAuthenticator, Rejected, SharedTokenAuthenticator},
     http_server::{Handlers, RelayService},
     metrics::{Metrics, RelayMetrics},
+    policy::{AllocationPolicy, Direction, ForwardAll, Packet, TrafficPolicy, Verdict},
+    relay::{AllocationConfig, ControlConnection, Relay},
     resolver::{DEFAULT_CERT_RELOAD_INTERVAL, reloading_resolver},
 };
 
@@ -120,16 +127,23 @@ pub struct RelayConfig {
     /// If *None* all the HTTP services that would be served here are served from
     /// [`RelayConfig::http_bind_addr`].
     pub tls: Option<TlsConfig>,
+    /// Configuration of the allocations handed out to clients.
+    ///
+    /// If *None* the relay does not accept clients and only serves its other HTTP
+    /// services.
+    pub allocations: Option<AllocationConfig>,
 }
 
 impl RelayConfig {
     /// Creates a new [`RelayConfig`] bound to `http_bind_addr` with default settings.
     ///
-    /// TLS is disabled. Enable it by assigning to [`RelayConfig::tls`] after construction.
+    /// TLS is disabled and no clients are accepted. Change this by assigning to
+    /// [`RelayConfig::tls`] and [`RelayConfig::allocations`] after construction.
     pub fn new(http_bind_addr: impl Into<SocketAddr>) -> Self {
         Self {
             http_bind_addr: http_bind_addr.into(),
             tls: None,
+            allocations: None,
         }
     }
 }
@@ -320,6 +334,8 @@ pub enum SpawnError {
     TlsHeaderParse { source: InvalidHeaderValue },
     #[error("Failed to bind TcpListener")]
     BindTlsListener { source: std::io::Error },
+    #[error("Invalid port range for allocations")]
+    InvalidPortRange { source: InvalidPortRange },
     #[error("Failed to build ACME client TLS config")]
     AcmeClientTlsConfig {
         #[error(std_err)]
@@ -396,7 +412,13 @@ impl Server {
                     Some(ref tls) => tls.https_bind_addr,
                     None => relay_config.http_bind_addr,
                 };
+                let relay = relay_config
+                    .allocations
+                    .map(|config| Relay::new(config, metrics.server.clone()))
+                    .transpose()
+                    .map_err(|err| e!(SpawnError::InvalidPortRange, err))?;
                 let mut builder = http_server::ServerBuilder::new(relay_bind_addr)
+                    .relay(relay)
                     .metrics(metrics.server.clone())
                     .headers(headers)
                     .request_handler(Method::GET, "/", Box::new(root_handler))
@@ -518,6 +540,14 @@ impl Server {
             None => None,
         };
         let quic_addr = quic_server.as_ref().map(|srv| srv.bind_addr());
+        // The QUIC server listens on a UDP port that may lie in the range of the
+        // allocations.
+        if let (Some(addr), Some(relay)) = (
+            quic_addr,
+            relay_service.as_ref().and_then(|service| service.relay()),
+        ) {
+            relay.exclude_port(addr.port());
+        }
         let quic_handle = quic_server.as_ref().map(|srv| srv.handle());
 
         let task = tokio::spawn(relay_supervisor(tasks, relay_server, quic_server));
@@ -582,6 +612,13 @@ impl Server {
     /// Returns the metrics collected in the relay server.
     pub fn metrics(&self) -> &RelayMetrics {
         &self.metrics
+    }
+
+    /// Returns the [`Relay`] that serves clients, if allocations are configured.
+    pub fn relay(&self) -> Option<&Relay> {
+        self.relay_service
+            .as_ref()
+            .and_then(|service| service.relay())
     }
 
     /// Returns the embedded [`RelayService`] that serves the relay's HTTP endpoints.

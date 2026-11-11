@@ -156,6 +156,19 @@ pub struct Datagram {
 }
 
 impl Datagram {
+    /// Returns the header that precedes the QUIC packet of a datagram with this remote
+    /// party.
+    ///
+    /// This allows building a datagram in place around a packet that is already in a
+    /// buffer, without copying the packet.
+    pub fn header(remote: RemoteAddr) -> [u8; DATAGRAM_HEADER_LEN] {
+        let mut header = [0u8; DATAGRAM_HEADER_LEN];
+        header[0] = if remote.tunnel { Flags::TUNNEL } else { 0 };
+        header[1..5].copy_from_slice(&remote.addr.ip().octets());
+        header[5..7].copy_from_slice(&remote.addr.port().to_be_bytes());
+        header
+    }
+
     fn encoded_len(&self) -> usize {
         DATAGRAM_HEADER_LEN + self.payload.len()
     }
@@ -168,8 +181,7 @@ impl Datagram {
             }
         );
         dst.reserve(self.encoded_len());
-        dst.put_u8(if self.remote.tunnel { Flags::TUNNEL } else { 0 });
-        put_socket_addr(dst, &self.remote.addr);
+        dst.put_slice(&Self::header(self.remote));
         dst.put_slice(&self.payload);
         Ok(())
     }

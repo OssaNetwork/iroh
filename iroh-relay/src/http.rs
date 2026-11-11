@@ -1,5 +1,10 @@
 //! HTTP-specific constants for the relay server and client.
 
+#[cfg(feature = "server")]
+pub(crate) const WEBSOCKET_UPGRADE_PROTOCOL: &str = "websocket";
+#[cfg(feature = "server")]
+pub(crate) const SUPPORTED_WEBSOCKET_VERSION: &str = "13";
+
 /// The path latency probes are made on, relative to the relay URL.
 ///
 /// Clients join it onto the relay URL, so a relay served under a path prefix

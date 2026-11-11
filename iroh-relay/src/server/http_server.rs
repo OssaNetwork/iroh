@@ -7,17 +7,37 @@
 
 use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use derive_more::Debug;
-use http::response::Builder as ResponseBuilder;
-use hyper::{HeaderMap, Method, Request, Response, StatusCode, body::Incoming, service::Service};
-use n0_error::{e, stack_error};
-use tokio::net::{TcpListener, TcpStream};
+use http::{
+    header::{CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION},
+    response::Builder as ResponseBuilder,
+};
+use hyper::{
+    HeaderMap, Method, Request, Response, StatusCode,
+    body::Incoming,
+    header::{HeaderValue, SEC_WEBSOCKET_ACCEPT, UPGRADE},
+    service::Service,
+    upgrade::Upgraded,
+};
+use n0_error::{e, ensure, stack_error};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    time::Instant,
+};
 use tokio_rustls_acme::AcmeAcceptor;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
-use tracing::{Instrument, debug, error, info, info_span};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use super::SpawnError;
-use crate::server::{metrics::Metrics, streams::MaybeTlsStream};
+use super::{SpawnError, relay::Relay};
+use crate::{
+    http::{SUPPORTED_WEBSOCKET_VERSION, WEBSOCKET_UPGRADE_PROTOCOL},
+    protos::{
+        relay::{CONTROL_RELATIVE_PATH, CONTROL_SUBPROTOCOL, MAX_FRAME_SIZE},
+        streams::WsBytesFramed,
+    },
+    server::{metrics::Metrics, streams::MaybeTlsStream},
+};
 
 /// Boxed HTTP response body produced by [`RelayService`].
 pub type BytesBody = Box<
@@ -34,10 +54,33 @@ pub(super) type HyperHandler = Box<
         + 'static,
 >;
 
-/// Timeout for a connection to finish the TLS and WebSocket upgrade handshakes.
+/// WebSocket GUID needed for accepting websocket connections, see RFC 6455 (<https://www.rfc-editor.org/rfc/rfc6455>) section 1.3
+const SEC_WEBSOCKET_ACCEPT_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Timeout for a connection to become established.
 ///
-/// The connection is aborted if it is still open after this timeout.
+/// A plain HTTP connection is aborted if it is still open after this timeout. A
+/// connection that is upgraded to a WebSocket has this long, counted from the upgrade
+/// request, for the client to authenticate and get its allocation.
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Derives the accept key for WebSocket handshake according to RFC 6455.
+/// Takes the client's Sec-WebSocket-Key value and returns the calculated accept key.
+fn derive_accept_key(client_key: &HeaderValue) -> String {
+    use sha1::Digest;
+
+    let mut sha1 = sha1::Sha1::new();
+    sha1.update(client_key.as_bytes());
+    sha1.update(SEC_WEBSOCKET_ACCEPT_GUID);
+    data_encoding::BASE64.encode(&sha1.finalize())
+}
+
+fn downcast_upgrade(upgraded: Upgraded) -> Option<(MaybeTlsStream, Bytes)> {
+    let parts = upgraded
+        .downcast::<hyper_util::rt::TokioIo<MaybeTlsStream>>()
+        .ok()?;
+    Some((parts.io.into_inner(), parts.read_buf))
+}
 
 /// Creates a new [`BytesBody`] with given content.
 fn body_full(content: impl Into<hyper::body::Bytes>) -> BytesBody {
@@ -263,6 +306,8 @@ pub(super) struct ServerBuilder {
     handlers: Handlers,
     /// Headers to use for HTTP responses.
     headers: HeaderMap,
+    /// The relay to serve on the control endpoint, if any.
+    relay: Option<Relay>,
     metrics: Option<Arc<Metrics>>,
     establish_timeout: Duration,
 }
@@ -275,6 +320,7 @@ impl ServerBuilder {
             tls_config: None,
             handlers: Default::default(),
             headers: HeaderMap::new(),
+            relay: None,
             metrics: None,
             establish_timeout: ESTABLISH_TIMEOUT,
         }
@@ -283,6 +329,12 @@ impl ServerBuilder {
     /// Sets the metrics collector.
     pub(super) fn metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Serves the control channels of `relay`.
+    pub(super) fn relay(mut self, relay: Option<Relay>) -> Self {
+        self.relay = relay;
         self
     }
 
@@ -318,6 +370,7 @@ impl ServerBuilder {
         let service = RelayService::new(
             self.handlers,
             self.headers,
+            self.relay,
             self.metrics.unwrap_or_default(),
         );
 
@@ -374,6 +427,7 @@ impl ServerBuilder {
                         }
                     }
                 }
+                service.shutdown();
                 set.shutdown().await;
                 debug!("server has been shutdown.");
             }
@@ -391,7 +445,10 @@ impl ServerBuilder {
 
 /// The hyper Service that serves the relay's HTTP endpoints.
 ///
-/// This service can be used standalone or embedded into an existing HTTP server.
+/// This service can be used standalone or embedded into an existing HTTP server. Note
+/// that the service has to be called with hyper's `io` argument set to a
+/// [`MaybeTlsStream`] wrapped by [`hyper_util::rt::TokioIo`], otherwise WebSocket
+/// requests fail after the upgrade.
 #[derive(Clone, Debug)]
 pub struct RelayService(Arc<Inner>);
 
@@ -399,7 +456,209 @@ pub struct RelayService(Arc<Inner>);
 struct Inner {
     handlers: Handlers,
     headers: HeaderMap,
+    relay: Option<Relay>,
     metrics: Arc<Metrics>,
+    establish_timeout: Duration,
+}
+
+#[stack_error(derive, add_meta)]
+enum UpgradeReqError {
+    #[error("missing header: {header}")]
+    MissingHeader { header: http::HeaderName },
+    #[error("invalid header value for {header}: {details}")]
+    InvalidHeader {
+        header: http::HeaderName,
+        details: String,
+    },
+    #[error(
+        "invalid header value for {SEC_WEBSOCKET_VERSION}: unsupported websocket version, only supporting {SUPPORTED_WEBSOCKET_VERSION}"
+    )]
+    UnsupportedWebsocketVersion,
+    #[error(
+        "invalid header value for {SEC_WEBSOCKET_PROTOCOL}: unsupported subprotocol: we support {we_support} but you only provide {you_support}"
+    )]
+    UnsupportedSubprotocol {
+        we_support: &'static str,
+        you_support: String,
+    },
+}
+
+/// Checks that `req` asks for a WebSocket speaking `subprotocol`.
+///
+/// Returns the client's key for the handshake.
+fn check_ws_upgrade(
+    req: &Request<Incoming>,
+    subprotocol: &'static str,
+) -> Result<HeaderValue, UpgradeReqError> {
+    fn expect_header(
+        req: &Request<Incoming>,
+        header: http::HeaderName,
+    ) -> Result<&HeaderValue, UpgradeReqError> {
+        req.headers()
+            .get(&header)
+            .ok_or_else(|| e!(UpgradeReqError::MissingHeader { header }))
+    }
+
+    let upgrade_header = expect_header(req, UPGRADE)?;
+    ensure!(
+        upgrade_header
+            .as_bytes()
+            .eq_ignore_ascii_case(WEBSOCKET_UPGRADE_PROTOCOL.as_bytes()),
+        UpgradeReqError::InvalidHeader {
+            header: UPGRADE,
+            details: format!("value must be {WEBSOCKET_UPGRADE_PROTOCOL}")
+        }
+    );
+
+    let key = expect_header(req, SEC_WEBSOCKET_KEY)?.clone();
+    let version = expect_header(req, SEC_WEBSOCKET_VERSION)?;
+    ensure!(
+        version.as_bytes() == SUPPORTED_WEBSOCKET_VERSION.as_bytes(),
+        UpgradeReqError::UnsupportedWebsocketVersion
+    );
+
+    let subprotocols = expect_header(req, SEC_WEBSOCKET_PROTOCOL)?
+        .to_str()
+        .map_err(|_| {
+            e!(UpgradeReqError::InvalidHeader {
+                header: SEC_WEBSOCKET_PROTOCOL,
+                details: "header value is not ascii".to_string()
+            })
+        })?;
+    ensure!(
+        subprotocols.split(',').any(|s| s.trim() == subprotocol),
+        UpgradeReqError::UnsupportedSubprotocol {
+            we_support: subprotocol,
+            you_support: subprotocols.to_string()
+        }
+    );
+    Ok(key)
+}
+
+impl RelayService {
+    fn build_response(&self) -> ResponseBuilder {
+        self.0.default_response()
+    }
+
+    /// Answers a WebSocket upgrade request.
+    ///
+    /// Once the connection is upgraded `serve` is called with the WebSocket and the head
+    /// of the request. It has until `deadline`, passed to it, to establish whatever it
+    /// serves.
+    fn handle_ws_upgrade<F, Fut>(
+        &self,
+        mut req: Request<Incoming>,
+        subprotocol: &'static str,
+        max_payload_len: usize,
+        serve: F,
+    ) -> HyperResult<Response<BytesBody>>
+    where
+        F: FnOnce(WsBytesFramed<MaybeTlsStream>, http::request::Parts, Instant) -> Fut
+            + Send
+            + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let key = match check_ws_upgrade(&req, subprotocol) {
+            Ok(key) => key,
+            // It's convention to send back the version(s) we *do* support
+            Err(err @ UpgradeReqError::UnsupportedWebsocketVersion { .. }) => {
+                return Ok(self
+                    .build_response()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(SEC_WEBSOCKET_VERSION, SUPPORTED_WEBSOCKET_VERSION)
+                    .body(body_full(err.to_string()))?);
+            }
+            Err(err) => {
+                return Ok(self
+                    .build_response()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(body_full(err.to_string()))?);
+            }
+        };
+
+        // Setup a future that will eventually receive the upgraded
+        // connection and talk a new protocol, and spawn the future
+        // into the runtime.
+        //
+        // Note: This can't possibly be fulfilled until the 101 response
+        // is returned below, so it's better to spawn this future instead
+        // waiting for it to complete to then return a response.
+        let deadline = Instant::now() + self.0.establish_timeout;
+        tokio::task::spawn(
+            async move {
+                let upgraded =
+                    match tokio::time::timeout_at(deadline, hyper::upgrade::on(&mut req)).await {
+                        Ok(Ok(upgraded)) => upgraded,
+                        Ok(Err(err)) => {
+                            warn!("upgrade error: {err:#}");
+                            return;
+                        }
+                        Err(_) => {
+                            debug!("upgrade timed out");
+                            return;
+                        }
+                    };
+                let Some((io, read_buf)) = downcast_upgrade(upgraded) else {
+                    warn!("could not downcast the upgraded connection to MaybeTlsStream");
+                    return;
+                };
+                if !read_buf.is_empty() {
+                    // The client must wait for the upgrade response before it sends
+                    // WebSocket frames.
+                    warn!("client sent data before the upgrade completed");
+                    return;
+                }
+                io.disable_nagle();
+                let websocket = tokio_websockets::ServerBuilder::new()
+                    .limits(
+                        tokio_websockets::Limits::default().max_payload_len(Some(max_payload_len)),
+                    )
+                    // Serve will create a WebSocketStream on an already upgraded connection
+                    .serve(io);
+                let (parts, _) = req.into_parts();
+                serve(WsBytesFramed { io: websocket }, parts, deadline).await;
+            }
+            .instrument(info_span!("handler")),
+        );
+
+        // Now return a 101 Response saying we agree to the upgrade to the
+        // websocket upgrade protocol
+        Ok(self
+            .build_response()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(
+                UPGRADE,
+                HeaderValue::from_static(WEBSOCKET_UPGRADE_PROTOCOL),
+            )
+            .header(SEC_WEBSOCKET_ACCEPT, derive_accept_key(&key))
+            .header(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static(subprotocol),
+            )
+            .header(CONNECTION, "upgrade")
+            .body(body_full("switching to websocket protocol"))?)
+    }
+
+    /// Upgrades the connection to the control channel of a client.
+    fn handle_control(
+        &self,
+        relay: Relay,
+        req: Request<Incoming>,
+    ) -> HyperResult<Response<BytesBody>> {
+        self.handle_ws_upgrade(
+            req,
+            CONTROL_SUBPROTOCOL,
+            MAX_FRAME_SIZE,
+            move |io, parts, deadline| async move {
+                let accept = relay.accept_control(io, parts.uri, parts.headers);
+                match tokio::time::timeout_at(deadline, accept).await {
+                    Ok(Ok(connection)) => connection.run().await,
+                    Ok(Err(err)) => debug!("control channel not accepted: {err:#}"),
+                    Err(_) => debug!("control channel establishment timed out"),
+                }
+            },
+        )
+    }
 }
 
 impl Service<Request<Incoming>> for RelayService {
@@ -409,6 +668,13 @@ impl Service<Request<Incoming>> for RelayService {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let uri = req.uri().clone();
+        if let Some(relay) = &self.0.relay
+            && req.method() == Method::GET
+            && uri.path().strip_prefix('/') == Some(CONTROL_RELATIVE_PATH)
+        {
+            return std::future::ready(self.handle_control(relay.clone(), req));
+        }
+
         if let Some(handler) = self.0.handlers.get(&(req.method().clone(), uri.path())) {
             let response = handler(req, self.0.default_response());
             return std::future::ready(response);
@@ -453,20 +719,41 @@ pub(super) enum TlsAcceptor {
 impl RelayService {
     /// Creates a new RelayService.
     ///
-    /// This allows embedding the relay service into an existing HTTP server.
-    pub fn new(handlers: Handlers, headers: HeaderMap, metrics: Arc<Metrics>) -> Self {
+    /// This allows embedding the relay service into an existing HTTP server. If `relay`
+    /// is given its control channels are served, otherwise only `handlers` are.
+    pub fn new(
+        handlers: Handlers,
+        headers: HeaderMap,
+        relay: Option<Relay>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self(Arc::new(Inner {
             handlers,
             headers,
+            relay,
             metrics,
+            establish_timeout: ESTABLISH_TIMEOUT,
         }))
+    }
+
+    /// Returns the relay whose control channels this service serves.
+    pub fn relay(&self) -> Option<&Relay> {
+        self.0.relay.as_ref()
+    }
+
+    /// Closes all control channels and releases all allocations.
+    pub fn shutdown(&self) {
+        if let Some(relay) = &self.0.relay {
+            relay.shutdown();
+        }
     }
 
     /// Handle the incoming connection.
     ///
     /// If a `tls_config` is given, will serve the connection using HTTPS, otherwise HTTP.
     ///
-    /// The connection is aborted if it is still open after `establish_timeout`.
+    /// A plain HTTP connection is aborted if it is still open after `establish_timeout`.
+    /// A connection that was upgraded to a WebSocket is not affected.
     ///
     /// # Example
     ///
@@ -482,7 +769,7 @@ impl RelayService {
     /// let handlers = Handlers::default();
     /// let headers = HeaderMap::new();
     /// let metrics = Arc::new(Metrics::default());
-    /// let relay_service = RelayService::new(handlers, headers, metrics);
+    /// let relay_service = RelayService::new(handlers, headers, None, metrics);
     ///
     /// // Generate a self-signed certificate for HTTPS
     /// let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;

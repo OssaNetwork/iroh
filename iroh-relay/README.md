@@ -7,8 +7,11 @@ address. The relay forwards QUIC packets without being able to read them.
 
 iroh's own relay protocol has been removed from this crate. It currently
 provides:
-- Relay Server: an HTTP or HTTPS server with latency probe and captive portal
-  endpoints. Optionally will also expose a QAD endpoint and metrics.
+- Relay Protocol: the frames exchanged between a relay and its clients.
+- Relay Server: gives each authenticated client a public UDP port and forwards
+  packets between that port and the client's control channel. Also serves
+  latency probe and captive portal endpoints, and optionally a QAD endpoint
+  and metrics.
 - Relay Client: a WebSocket dialer for connecting to the relay.
 - Server Binary: A CLI for running your own relay server.
 
@@ -26,6 +29,50 @@ cargo build \
 ```
 
 You will find the optimised binary at `target/optimized-release/iroh-relay`.
+
+## Accepting clients
+
+The relay only accepts clients when the `allocations` section is present in
+the TOML config file.
+
+```toml
+[allocations]
+# The public IPv4 address of the relay. Clients advertise it as their own.
+public_ip = "203.0.113.5"
+# The local address the clients' UDP sockets are bound to, if it differs from
+# the public address (hosts behind a 1:1 NAT). Defaults to public_ip.
+# bind_ip = "10.0.0.5"
+# The ports handed out to clients. Defaults to 1024 to 65535.
+# port_range_start = 1024
+# port_range_end = 65535
+# How long a port stays reserved for a client after it disconnected.
+# Defaults to 30, with 0 ports are released immediately.
+# release_timeout_secs = 30
+# The largest QUIC packet forwarded. Defaults to 1500.
+# max_packet_size = 1500
+# The tokens clients present to use the relay.
+shared_tokens = ["token-a", "token-b"]
+```
+
+A client that reconnects within the release timeout keeps its port. One
+relay address serves at most one client per port, so the port range bounds
+the number of clients.
+
+### Authentication
+
+The binary authenticates clients with shared tokens: a client names itself
+and presents one of the configured tokens. Anyone who knows a token can use
+any name, and take over the port of the client with that name, so this is
+meant for tests and private relays. The token list can also be set with the
+`IROH_RELAY_SHARED_TOKEN` environment variable, which sets a single token and
+takes precedence over the config file.
+
+To authenticate clients differently, embed the relay as a library and
+implement `iroh_relay::server::Authenticator`. It receives the credentials
+the client presented and a value bound to the TLS session of the control
+channel, and returns the identity of the client. The same goes for
+`TrafficPolicy`, which decides which packets are forwarded. The binary
+forwards every packet.
 
 ## Local testing
 

@@ -7,6 +7,49 @@ use iroh_metrics::{Counter, MetricsGroup, MetricsGroupSet};
 #[metrics(name = "relayserver")]
 #[non_exhaustive]
 pub struct Metrics {
+    /*
+     * Metrics about clients and their allocations
+     */
+    /// Number of control channels opened, including those that failed to authenticate.
+    pub control_connections: Counter,
+    /// Number of control channels whose credentials were rejected.
+    pub auth_rejected: Counter,
+    /// Number of allocations created for a client that did not have one.
+    pub allocations_created: Counter,
+    /// Number of times a client got its existing allocation back: by reconnecting within
+    /// the release timeout, or by taking over from another control channel.
+    pub allocations_resumed: Counter,
+    /// Number of allocations released.
+    ///
+    /// The number of allocations at any time is `allocations_created` -
+    /// `allocations_released`.
+    pub allocations_released: Counter,
+    /// Number of times a client could not get a port because none was free.
+    pub ports_exhausted: Counter,
+
+    /*
+     * Metrics about packets
+     */
+    /// Number of packets forwarded from a remote party to a client.
+    pub packets_inbound: Counter,
+    /// Number of payload bytes forwarded from a remote party to a client.
+    pub bytes_inbound: Counter,
+    /// Number of packets forwarded from a client to a remote party.
+    pub packets_outbound: Counter,
+    /// Number of payload bytes forwarded from a client to a remote party.
+    pub bytes_outbound: Counter,
+    /// Number of packets dropped by the traffic policy, in either direction.
+    pub packets_dropped_policy: Counter,
+    /// Number of inbound packets dropped because the client's queue was full.
+    pub packets_dropped_queue_full: Counter,
+    /// Number of inbound packets dropped because the client was not connected.
+    pub packets_dropped_detached: Counter,
+    /// Number of packets dropped because they were empty, too large, or addressed to a
+    /// destination that can not be a remote party.
+    pub packets_dropped_invalid: Counter,
+    /// Number of outbound packets the relay failed to send.
+    pub packets_dropped_send_failed: Counter,
+
     /// Number of incoming QAD connections.
     ///
     /// After completion, each is counted in either `qad_incoming_error` or `qad_connections`.

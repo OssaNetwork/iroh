@@ -4,8 +4,10 @@
 //! [`iroh_relay::server`].
 
 use std::{
-    net::{Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -26,6 +28,8 @@ use webpki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 /// The default `http_bind_port` when using `--dev`.
 const DEV_MODE_HTTP_PORT: u16 = 3340;
+/// Environment variable to set the token clients present to use the relay.
+const ENV_SHARED_TOKEN: &str = "IROH_RELAY_SHARED_TOKEN";
 /// Environment variable to override the ACME directory URL.
 const ENV_ACME_URL: &str = "IROH_RELAY_ACME_URL";
 /// Environment variable to trust an additional CA for the ACME server's TLS certificate.
@@ -135,6 +139,86 @@ struct Config {
     /// Defaults to `http_bind_addr` with the port set to [`DEFAULT_METRICS_PORT`]
     /// (`[::]:9090` when `http_bind_addr` is set to the default).
     metrics_bind_addr: Option<SocketAddr>,
+    /// The allocations handed out to clients.
+    ///
+    /// If not present the relay does not accept clients.
+    allocations: Option<AllocationsConfig>,
+}
+
+/// Configuration of the public UDP ports handed out to clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AllocationsConfig {
+    /// The public IPv4 address of the relay. Clients advertise it as their own.
+    public_ip: Ipv4Addr,
+    /// The local address the clients' UDP sockets are bound to.
+    ///
+    /// Set this on hosts behind a 1:1 NAT, where the public address is not a local one.
+    /// Defaults to `public_ip`.
+    bind_ip: Option<Ipv4Addr>,
+    /// The first port handed out to clients. Defaults to 1024.
+    port_range_start: Option<u16>,
+    /// The last port handed out to clients. Defaults to 65535.
+    port_range_end: Option<u16>,
+    /// How many seconds a port stays reserved for its client after the client's control
+    /// channel closed. Defaults to 30. With 0 ports are released immediately.
+    release_timeout_secs: Option<u64>,
+    /// The largest QUIC packet forwarded, in bytes. Defaults to 1500.
+    max_packet_size: Option<usize>,
+    /// The tokens clients present to use the relay.
+    ///
+    /// A client names itself and presents one of these tokens. Anyone who knows a token
+    /// can use any name, and take over the port of the client with that name. This is
+    /// meant for tests and private relays. To authenticate clients differently, embed the
+    /// relay as a library and provide an `Authenticator`.
+    ///
+    /// The token list can also be set with the `IROH_RELAY_SHARED_TOKEN` environment
+    /// variable, which sets a single token and takes precedence over this value.
+    ///
+    /// Must contain at least one non-empty token.
+    #[serde(default)]
+    shared_tokens: Vec<String>,
+}
+
+impl AllocationsConfig {
+    fn into_allocation_config(self) -> Result<relay::AllocationConfig> {
+        let mut tokens = self.shared_tokens;
+        if let Ok(token) = std::env::var(ENV_SHARED_TOKEN) {
+            tokens = vec![token];
+        }
+        if tokens.is_empty() || tokens.iter().any(|token| token.is_empty()) {
+            bail_any!("allocations.shared_tokens must not be empty or contain empty strings");
+        }
+        let start = self
+            .port_range_start
+            .unwrap_or(*relay::allocator::DEFAULT_PORT_RANGE.start());
+        let end = self
+            .port_range_end
+            .unwrap_or(*relay::allocator::DEFAULT_PORT_RANGE.end());
+        if start == 0 || start > end {
+            bail_any!("allocations: invalid port range {start}..={end}");
+        }
+        let max_packet_size = self
+            .max_packet_size
+            .unwrap_or(relay::relay::DEFAULT_MAX_PACKET_SIZE);
+        if max_packet_size == 0 || max_packet_size > iroh_relay::protos::relay::MAX_PACKET_SIZE {
+            bail_any!("allocations: invalid max_packet_size {max_packet_size}");
+        }
+
+        let mut config = relay::AllocationConfig::new(
+            self.public_ip,
+            Arc::new(relay::SharedTokenAuthenticator::new(tokens)),
+            Arc::new(relay::ForwardAll),
+        );
+        config.bind_ip = self.bind_ip.unwrap_or(self.public_ip);
+        config.ports = start..=end;
+        config.release_timeout = self
+            .release_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(relay::allocator::DEFAULT_RELEASE_TIMEOUT);
+        config.max_packet_size = max_packet_size;
+        Ok(config)
+    }
 }
 
 impl Config {
@@ -158,6 +242,7 @@ impl Default for Config {
             enable_quic_addr_discovery: cfg_defaults::enable_quic_addr_discovery(),
             enable_metrics: cfg_defaults::enable_metrics(),
             metrics_bind_addr: None,
+            allocations: None,
         }
     }
 }
@@ -496,6 +581,11 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
     let relay_config = if cfg.enable_relay {
         let mut relay_config = relay::RelayConfig::new(cfg.http_bind_addr());
         relay_config.tls = tls_config;
+        relay_config.allocations = cfg
+            .allocations
+            .clone()
+            .map(AllocationsConfig::into_allocation_config)
+            .transpose()?;
         Some(relay_config)
     } else {
         None
@@ -531,6 +621,64 @@ mod tests {
                 "config must be rejected: {config}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_allocations_config() -> Result {
+        let config = Config::from_str("")?;
+        let relay = build_relay_config(config).await?.relay.expect("relay");
+        assert!(relay.allocations.is_none());
+
+        let config = Config::from_str(
+            r#"
+            [allocations]
+            public_ip = "203.0.113.5"
+            shared_tokens = ["token"]
+        "#,
+        )?;
+        let relay = build_relay_config(config).await?.relay.expect("relay");
+        let allocations = relay.allocations.expect("allocations");
+        assert_eq!(allocations.public_ip, Ipv4Addr::new(203, 0, 113, 5));
+        assert_eq!(allocations.bind_ip, allocations.public_ip);
+        assert_eq!(allocations.ports, 1024..=65535);
+        assert_eq!(allocations.release_timeout, Duration::from_secs(30));
+        assert_eq!(allocations.max_packet_size, 1500);
+
+        let config = Config::from_str(
+            r#"
+            [allocations]
+            public_ip = "203.0.113.5"
+            bind_ip = "10.0.0.5"
+            port_range_start = 40000
+            port_range_end = 50000
+            release_timeout_secs = 0
+            max_packet_size = 1400
+            shared_tokens = ["token"]
+        "#,
+        )?;
+        let relay = build_relay_config(config).await?.relay.expect("relay");
+        let allocations = relay.allocations.expect("allocations");
+        assert_eq!(allocations.bind_ip, Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(allocations.ports, 40000..=50000);
+        assert_eq!(allocations.release_timeout, Duration::ZERO);
+        assert_eq!(allocations.max_packet_size, 1400);
+
+        for invalid in [
+            // No tokens, and an empty token.
+            "[allocations]\npublic_ip = \"203.0.113.5\"",
+            "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"\"]",
+            // Unusable port ranges.
+            "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"t\"]\nport_range_start = 0",
+            "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"t\"]\nport_range_start = 9\nport_range_end = 8",
+            "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"t\"]\nmax_packet_size = 0",
+        ] {
+            let config = Config::from_str(invalid)?;
+            assert!(
+                build_relay_config(config).await.is_err(),
+                "config must be rejected: {invalid}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]

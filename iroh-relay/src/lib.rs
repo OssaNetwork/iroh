@@ -22,6 +22,7 @@
 #![deny(missing_docs, rustdoc::broken_intra_doc_links, unreachable_pub)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+pub mod auth;
 pub mod client;
 pub mod defaults;
 pub mod http;

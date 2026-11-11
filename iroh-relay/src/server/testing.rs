@@ -53,6 +53,7 @@ pub fn relay_config() -> RelayConfig {
     RelayConfig {
         http_bind_addr: (Ipv4Addr::LOCALHOST, 0).into(),
         tls: Some(tls_config()),
+        allocations: None,
     }
 }
 
