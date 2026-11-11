@@ -14,7 +14,8 @@ use iroh_relay::{
     client::{LinkState, PathAddr, RelayLink, RelaySocket, RelaySocketHandle, WsDialer},
     protos::relay::MAX_FRAME_SIZE,
     server::{
-        AllocationConfig, DefaultPolicy, Server, ServerConfig, SharedTokenAuthenticator, testing,
+        AllocationConfig, ClientId, DefaultPolicy, Server, ServerConfig, SharedTokenAuthenticator,
+        testing,
     },
     tls::make_dangerous_client_config,
 };
@@ -99,6 +100,12 @@ struct Bob {
 }
 
 fn bob(server_config: noq::ServerConfig) -> Bob {
+    relay_endpoint(Some(server_config))
+}
+
+/// An endpoint on a relay socket, which accepts connections if it has a server
+/// configuration.
+fn relay_endpoint(server_config: Option<noq::ServerConfig>) -> Bob {
     let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let SocketAddr::V4(local_addr) = socket.local_addr().unwrap() else {
         panic!("not an IPv4 socket");
@@ -108,7 +115,7 @@ fn bob(server_config: noq::ServerConfig) -> Bob {
     let (socket, handle) = RelaySocket::new(inner).unwrap();
     let endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
-        Some(server_config),
+        server_config,
         Box::new(socket),
         runtime,
     )
@@ -362,7 +369,7 @@ async fn link_reconnects_after_the_relay_restarts_its_connection() {
 
     // Close every control channel the relay has. The link reconnects on its own.
     let relay = server.relay().unwrap();
-    assert!(relay.disconnect(&iroh_relay::server::ClientId::new("bob")));
+    assert!(relay.disconnect(&ClientId::new("bob")));
     let reconnected = timeout(TIMEOUT, async {
         loop {
             state.changed().await.unwrap();
@@ -440,10 +447,6 @@ async fn socket_requires_an_ipv4_socket() {
     assert!(RelaySocket::new(inner).is_err());
 }
 
-fn bob_id() -> iroh_relay::server::ClientId {
-    iroh_relay::server::ClientId::new("bob")
-}
-
 /// A transport configuration with multipath and NAT traversal, which lets a connection
 /// add a direct path next to a relayed one.
 fn traversal_transport() -> Arc<noq::TransportConfig> {
@@ -467,30 +470,14 @@ async fn connection_adds_a_direct_path_next_to_the_relayed_one() {
     let bob = bob(server_config);
     let link = bob.connect_relay(&server, "bob");
     let public_addr = timeout(TIMEOUT, link.public_addr()).await.unwrap().unwrap();
-    let alice = {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let runtime = Arc::new(TokioRuntime);
-        let inner = runtime.wrap_udp_socket(socket).unwrap();
-        let (socket, _handle) = RelaySocket::new(inner).unwrap();
-        let endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            None,
-            Box::new(socket),
-            runtime,
-        )
-        .unwrap();
-        endpoint.set_default_client_config(client_config);
-        endpoint
-    };
-    let alice_local = PathAddr::from_socket_addr(alice.local_addr().unwrap());
-    let PathAddr::Direct(SocketAddr::V4(alice_local)) = alice_local else {
-        panic!("unexpected local address {alice_local:?}");
-    };
-    let alice_local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, alice_local.port());
+    let alice = relay_endpoint(None);
+    alice.endpoint.set_default_client_config(client_config);
+    let alice_local = alice.local_addr;
 
     let (alice_conn, bob_conn) = tokio::join!(
         async {
             alice
+                .endpoint
                 .connect(public_addr.into(), "localhost")
                 .unwrap()
                 .await
@@ -516,6 +503,8 @@ async fn connection_adds_a_direct_path_next_to_the_relayed_one() {
     loop {
         let known = alice_conn.get_remote_nat_traversal_addresses().unwrap();
         if !known.is_empty() {
+            // The connection reports addresses in their plain form.
+            assert_eq!(known, vec![SocketAddr::V4(bob.local_addr)]);
             break;
         }
         assert!(
@@ -525,14 +514,20 @@ async fn connection_adds_a_direct_path_next_to_the_relayed_one() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let probing = alice_conn.initiate_nat_traversal_round().unwrap();
-    assert!(!probing.is_empty());
+    assert_eq!(probing, vec![direct(bob.local_addr)]);
 
     // A second path comes up, directly between the two sockets.
     let new_path = timeout(TIMEOUT, async {
         loop {
             match alice_paths.next().await {
-                Some(Ok(noq::PathEvent::Established { id, .. })) if id != noq::PathId::ZERO => {
-                    break id;
+                Some(Ok(noq::PathEvent::Established { id, .. })) => {
+                    let remote = alice_conn
+                        .path(id)
+                        .and_then(|path| path.remote_address().ok())
+                        .map(PathAddr::from_socket_addr);
+                    if remote == Some(PathAddr::Direct(bob.local_addr.into())) {
+                        break id;
+                    }
                 }
                 Some(_) => continue,
                 None => panic!("the connection closed"),
@@ -541,11 +536,7 @@ async fn connection_adds_a_direct_path_next_to_the_relayed_one() {
     })
     .await
     .expect("no direct path was established");
-    let remote = alice_conn.path(new_path).unwrap().remote_address().unwrap();
-    assert_eq!(
-        PathAddr::from_socket_addr(remote),
-        PathAddr::Direct(bob.local_addr.into())
-    );
+    assert_ne!(new_path, noq::PathId::ZERO);
 
     // Bob sees the same path from his end.
     let bob_direct = timeout(TIMEOUT, async {
@@ -566,29 +557,40 @@ async fn connection_adds_a_direct_path_next_to_the_relayed_one() {
     );
 
     // Bob closes the relayed path. Only he knows which one that is: to the dialer the
-    // address she dialed is an address like any other. What follows goes the direct way.
+    // address she dialed is an address like any other.
     bob_conn.path(noq::PathId::ZERO).unwrap().close().unwrap();
-    let before = server.metrics().server.packets_inbound.get();
+    timeout(TIMEOUT, async {
+        loop {
+            match alice_paths.next().await {
+                Some(Ok(noq::PathEvent::Abandoned { id, .. })) if id == noq::PathId::ZERO => {
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("the connection closed"),
+            }
+        }
+    })
+    .await
+    .expect("the dialer did not learn that the relayed path was closed");
+
+    // What follows goes the direct way, in both directions. A few packets that finish
+    // off the closed path may still pass through the relay.
+    let through_relay = || {
+        let metrics = &server.metrics().server;
+        metrics.packets_inbound.get() + metrics.packets_outbound.get()
+    };
+    let before = through_relay();
     let large: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
     echo(&alice_conn, &large).await;
-    let through_relay = server.metrics().server.packets_inbound.get() - before;
+    let through_relay = through_relay() - before;
     assert!(
         through_relay < 20,
         "{through_relay} packets still went through the relay"
     );
 
-    // The connection outlives the relay: with the link gone only the direct path is left.
-    drop(link);
-    let relay = server.relay().unwrap();
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while relay.allocation_count() != 0 && relay.port_of(&bob_id()).is_some() {
-        // The port stays reserved for a while. What matters is that nobody serves it.
-        if !relay.disconnect(&bob_id()) {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "link not closed");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // The connection does not need the relay any more: it carries on when the relay is
+    // gone, while Bob's link to it is still trying to get it back.
+    server.shutdown().await.unwrap();
     echo(&alice_conn, &large).await;
     echo(&alice_conn, b"without the relay").await;
 }
