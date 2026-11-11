@@ -111,3 +111,29 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Bytes> for WsBytesFramed<T> {
             .map_err(AnyError::from_std)
     }
 }
+
+/// Writes `first` and the messages that are already waiting in `more`, at most `max`
+/// messages in total, and flushes once.
+///
+/// Flushing once per batch instead of once per message saves system calls when messages
+/// arrive faster than they are written.
+pub(crate) async fn write_batch<S, T>(
+    io: &mut S,
+    first: T,
+    more: &mut tokio::sync::mpsc::Receiver<T>,
+    max: usize,
+) -> Result<(), S::Error>
+where
+    S: Sink<T> + Unpin,
+{
+    use n0_future::SinkExt;
+
+    io.feed(first).await?;
+    for _ in 1..max {
+        match more.try_recv() {
+            Ok(message) => io.feed(message).await?,
+            Err(_) => break,
+        }
+    }
+    io.flush().await
+}

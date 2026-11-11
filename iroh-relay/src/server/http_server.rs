@@ -29,7 +29,10 @@ use tokio_rustls_acme::AcmeAcceptor;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use super::{SpawnError, relay::Relay};
+use super::{
+    SpawnError,
+    relay::{Relay, TunnelError},
+};
 use crate::{
     http::{SUPPORTED_WEBSOCKET_VERSION, WEBSOCKET_UPGRADE_PROTOCOL},
     protos::{
@@ -676,8 +679,15 @@ impl RelayService {
     ) -> HyperResult<Response<BytesBody>> {
         // Refuse before the upgrade. A dialer takes a rejected upgrade to mean that
         // there is no fallback at this address.
-        if !relay.has_port(port) {
-            return self.0.not_found_fn(req, self.0.default_response());
+        match relay.check_tunnel(port) {
+            Ok(()) => {}
+            Err(TunnelError::TooManyTunnels { .. }) => {
+                return Ok(self
+                    .build_response()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(body_full("too many tunnels"))?);
+            }
+            Err(_) => return self.0.not_found_fn(req, self.0.default_response()),
         }
         self.handle_ws_upgrade(
             req,

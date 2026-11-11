@@ -433,18 +433,28 @@ async fn no_fallback_without_a_tunnel() {
     timeout(TIMEOUT, tunnel.connected()).await.unwrap().unwrap();
 }
 
+/// Opens a tunnel from a new dialer and connects to Bob through it, so that Bob has
+/// answered the tunnel.
+async fn connect_through_tunnel(setup: &Setup) -> (Peer, TunnelLink, noq::Connection) {
+    let dialer = peer(None, setup.client_config.clone());
+    let tunnel = dialer
+        .handle
+        .open_tunnel(setup.target, setup.relay.tunnel_config());
+    let connecting = dialer.endpoint.connect(tunnel.addr(), "localhost").unwrap();
+    let conn = timeout(TIMEOUT, connecting).await.unwrap().unwrap();
+    echo(&conn, b"hello").await;
+    (dialer, tunnel, conn)
+}
+
 #[tokio::test]
-async fn tunnels_are_limited_and_end_with_the_allocation() {
-    let setup = setup(|config| {
-        config.max_tunnels = 2;
-        config.release_timeout = Duration::ZERO;
-    })
-    .await;
+async fn unused_tunnels_make_room_for_new_ones() {
+    let setup = setup(|config| config.max_tunnels = 2).await;
+    setup.relay.udp_blocked.store(true, Ordering::Relaxed);
     let relay = &setup.relay;
     let metrics = relay.server.metrics();
 
-    // Each dialer has its own socket, and with it its own tunnel to the target.
-    let dialers: Vec<Peer> = (0..3)
+    // Two tunnels that carry nothing. Each dialer has its own socket.
+    let idlers: Vec<Peer> = (0..2)
         .map(|_| peer(None, setup.client_config.clone()))
         .collect();
     let open = |dialer: &Peer| {
@@ -452,24 +462,130 @@ async fn tunnels_are_limited_and_end_with_the_allocation() {
             .handle
             .open_tunnel(setup.target, relay.tunnel_config())
     };
-    let first = open(&dialers[0]);
-    let second = open(&dialers[1]);
+    let first = open(&idlers[0]);
     timeout(TIMEOUT, first.connected()).await.unwrap().unwrap();
+    eventually("the first tunnel is open", || {
+        metrics.server.tunnels_opened.get() == 1
+    })
+    .await;
+    let second = open(&idlers[1]);
     timeout(TIMEOUT, second.connected()).await.unwrap().unwrap();
+    eventually("the second tunnel is open", || {
+        metrics.server.tunnels_opened.get() == 2
+    })
+    .await;
+
+    // A dialer that means it is not kept out: the oldest unused tunnel is closed.
+    let (_dialer, used, conn) = connect_through_tunnel(&setup).await;
+    closed(&first).await;
+    assert_eq!(metrics.server.tunnels_evicted.get(), 1);
+    assert_eq!(second.state(), TunnelState::Connected);
+
+    // The next one closes the other unused tunnel, not the one that is in use.
+    let (_dialer2, used2, conn2) = connect_through_tunnel(&setup).await;
+    closed(&second).await;
+    assert_eq!(metrics.server.tunnels_evicted.get(), 2);
+    echo(&conn, b"still here").await;
+
+    // Now both tunnels are in use. A further one is refused before the upgrade.
+    let late = peer(None, setup.client_config.clone());
+    let refused = open(&late);
+    let reason = closed(&refused).await;
+    assert!(reason.contains("503"), "unexpected reason: {reason}");
+    assert_eq!(metrics.server.tunnels_opened.get(), 4);
+    echo(&conn2, b"still here too").await;
+    assert_eq!(used.state(), TunnelState::Connected);
+    assert_eq!(used2.state(), TunnelState::Connected);
+}
+
+#[tokio::test]
+async fn tunnels_can_be_disabled() {
+    let setup = setup(|config| config.max_tunnels = 0).await;
+    let alice = peer(None, setup.client_config.clone());
+    let tunnel = alice
+        .handle
+        .open_tunnel(setup.target, setup.relay.tunnel_config());
+    // Refused before the upgrade, like a port without an allocation.
+    let reason = closed(&tunnel).await;
+    assert!(reason.contains("404"), "unexpected reason: {reason}");
+    let metrics = setup.relay.server.metrics();
+    assert_eq!(metrics.server.tunnels_opened.get(), 0);
+    assert_eq!(metrics.server.tunnels_rejected.get(), 0);
+}
+
+#[tokio::test]
+async fn one_tunnel_per_target() {
+    let setup = setup(|_| {}).await;
+    setup.relay.udp_blocked.store(true, Ordering::Relaxed);
+    let relay = &setup.relay;
+    let metrics = relay.server.metrics();
+    let alice = peer(None, setup.client_config.clone());
+
+    // Two dials to the same peer share the tunnel.
+    let first = alice
+        .handle
+        .open_tunnel(setup.target, relay.tunnel_config());
+    let second = alice
+        .handle
+        .open_tunnel(setup.target, relay.tunnel_config());
+    assert_eq!(first.addr(), second.addr());
+    let connecting = alice.endpoint.connect(first.addr(), "localhost").unwrap();
+    let conn = timeout(TIMEOUT, connecting).await.unwrap().unwrap();
+    echo(&conn, b"one").await;
+    assert_eq!(metrics.server.tunnels_opened.get(), 1);
+
+    // Dropping one of the links does not take the tunnel from the other.
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    echo(&conn, b"two").await;
+    assert_eq!(first.state(), TunnelState::Connected);
+    assert_eq!(metrics.server.tunnels_closed.get(), 0);
+
+    // The last link closes it. Afterwards a new tunnel is opened for the target.
+    drop(first);
+    eventually("the tunnel is closed", || {
+        metrics.server.tunnels_closed.get() == 1
+    })
+    .await;
+    let again = alice
+        .handle
+        .open_tunnel(setup.target, relay.tunnel_config());
+    timeout(TIMEOUT, again.connected()).await.unwrap().unwrap();
+    eventually("a new tunnel is open", || {
+        metrics.server.tunnels_opened.get() == 2
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tunnels_end_with_the_allocation() {
+    let setup = setup(|config| config.release_timeout = Duration::ZERO).await;
+    let relay = &setup.relay;
+    let metrics = relay.server.metrics();
+    let dialers: Vec<Peer> = (0..2)
+        .map(|_| peer(None, setup.client_config.clone()))
+        .collect();
+    let tunnels: Vec<TunnelLink> = dialers
+        .iter()
+        .map(|dialer| {
+            dialer
+                .handle
+                .open_tunnel(setup.target, relay.tunnel_config())
+        })
+        .collect();
+    for tunnel in &tunnels {
+        timeout(TIMEOUT, tunnel.connected()).await.unwrap().unwrap();
+    }
     eventually("both tunnels are open", || {
         metrics.server.tunnels_opened.get() == 2
     })
     .await;
 
-    // The third one is turned away.
-    let third = open(&dialers[2]);
-    closed(&third).await;
-    assert_eq!(metrics.server.tunnels_rejected.get(), 1);
-
     // When Bob leaves, his allocation is released and its tunnels are closed.
     drop(setup.link);
-    closed(&first).await;
-    closed(&second).await;
+    for tunnel in &tunnels {
+        closed(tunnel).await;
+    }
     eventually("the tunnels are closed", || {
         metrics.server.tunnels_closed.get() == 2
     })

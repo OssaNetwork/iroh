@@ -37,6 +37,8 @@ pub struct Metrics {
     pub tunnels_closed: Counter,
     /// Number of tunnels refused because too many were open to the allocation.
     pub tunnels_rejected: Counter,
+    /// Number of tunnels closed to make room for a newer one.
+    pub tunnels_evicted: Counter,
 
     /*
      * Metrics about packets

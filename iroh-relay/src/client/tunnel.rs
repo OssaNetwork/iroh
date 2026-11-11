@@ -2,26 +2,23 @@
 
 use std::{
     net::{SocketAddr, SocketAddrV4},
-    sync::Weak,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
 use bytes::Bytes;
 use iroh_dns::dns::DnsResolver;
 use n0_future::{SinkExt, StreamExt, time};
+
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, trace};
 use url::Url;
 
-use super::{
-    WsConnection, WsDialer,
-    addr::PathAddr,
-    link::Inbound,
-    socket::{Shared, TunnelRegistration},
-};
-use crate::protos::relay::{
-    MAX_TUNNEL_FRAME_SIZE, TUNNEL_RELATIVE_PATH_PREFIX, TUNNEL_SUBPROTOCOL,
+use super::{WsConnection, WsDialer, addr::PathAddr, link::Inbound, socket::TunnelRegistration};
+use crate::protos::{
+    relay::{MAX_TUNNEL_FRAME_SIZE, TUNNEL_RELATIVE_PATH_PREFIX, TUNNEL_SUBPROTOCOL},
+    streams::write_batch,
 };
 
 /// The TCP port a relay serves tunnels on.
@@ -35,6 +32,9 @@ const WRITE_BATCH: usize = 64;
 
 /// How long a single write to the tunnel may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long opening the tunnel may take, from the TCP connection to the upgrade.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How to open a [`TunnelLink`].
 #[derive(Debug, Clone)]
@@ -50,15 +50,21 @@ pub struct TunnelConfig {
     pub tcp_port: u16,
     /// An HTTP proxy to connect through.
     pub proxy_url: Option<Url>,
+    /// Resolves the host of the proxy. The relay itself is addressed by IP.
+    pub dns_resolver: DnsResolver,
 }
 
 impl TunnelConfig {
     /// Creates a configuration with the given TLS configuration.
+    ///
+    /// This sets up a DNS resolver. Create the configuration once and clone it for every
+    /// tunnel.
     pub fn new(tls_config: rustls::ClientConfig) -> Self {
         Self {
             tls_config,
             tcp_port: TUNNEL_TCP_PORT,
             proxy_url: None,
+            dns_resolver: DnsResolver::new(),
         }
     }
 }
@@ -81,74 +87,106 @@ pub enum TunnelState {
 
 /// A TCP tunnel to a peer behind a relay.
 ///
-/// Created with [`RelaySocketHandle::open_tunnel`]. Dropping the link closes the tunnel in
-/// the background.
+/// Created with [`RelaySocketHandle::open_tunnel`]. Clones refer to the same tunnel, which
+/// is closed in the background when the last of them is dropped.
+///
+/// The relay closes a tunnel that carries no packets for two minutes. The QUIC connection
+/// inside needs a keep-alive interval, or an idle timeout, shorter than that. A tunnel
+/// that closed is not opened again, see [`TunnelState::Closed`].
 ///
 /// [`RelaySocketHandle::open_tunnel`]: super::RelaySocketHandle::open_tunnel
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TunnelLink {
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+pub(super) struct Inner {
     target: SocketAddrV4,
     state: watch::Receiver<TunnelState>,
     /// Stops the task. The task is not aborted, so that it can close the tunnel properly.
     cancel: CancellationToken,
-    _registration: TunnelRegistration,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl TunnelLink {
+    /// Starts opening a tunnel. `registration` is dropped when the tunnel is over.
     pub(super) fn spawn(
         target: SocketAddrV4,
         config: TunnelConfig,
         inbound: mpsc::Sender<Inbound>,
-        shared: Weak<Shared>,
-    ) -> (Self, mpsc::Sender<Bytes>) {
-        let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_DEPTH);
+        outbound: mpsc::Receiver<Bytes>,
+        registration: TunnelRegistration,
+    ) -> Self {
         let (state_tx, state_rx) = watch::channel(TunnelState::Connecting);
         let cancel = CancellationToken::new();
         let actor = Actor {
             target,
             config,
             inbound,
-            outbound: outbound_rx,
+            outbound,
             state: state_tx,
             cancel: cancel.clone(),
+            _registration: registration,
         };
         n0_future::task::spawn(actor.run().instrument(info_span!("tunnel", %target)));
-        let link = Self {
-            target,
-            state: state_rx,
-            cancel,
-            _registration: TunnelRegistration::new(shared, target, outbound_tx.clone()),
-        };
-        (link, outbound_tx)
+        Self {
+            inner: Arc::new(Inner {
+                target,
+                state: state_rx,
+                cancel,
+            }),
+        }
+    }
+
+    /// Creates the queue of packets for a tunnel.
+    pub(super) fn outbound_queue() -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+        mpsc::channel(OUTBOUND_QUEUE_DEPTH)
+    }
+
+    /// Returns a link to the tunnel behind `inner`, if it is still usable.
+    pub(super) fn upgrade(inner: &Weak<Inner>) -> Option<Self> {
+        let inner = inner.upgrade()?;
+        let closed = matches!(*inner.state.borrow(), TunnelState::Closed(_));
+        (!closed).then_some(Self { inner })
+    }
+
+    pub(super) fn downgrade(&self) -> Weak<Inner> {
+        Arc::downgrade(&self.inner)
     }
 
     /// Returns the address the peer advertises, which the tunnel leads to.
     pub fn target(&self) -> SocketAddrV4 {
-        self.target
+        self.inner.target
     }
 
     /// Returns the address to dial the peer at with the QUIC stack, to reach it through
     /// the tunnel.
     pub fn addr(&self) -> SocketAddr {
         PathAddr::Tunnel {
-            target: self.target,
+            target: self.inner.target,
         }
         .to_socket_addr()
     }
 
     /// Returns the current state of the tunnel.
     pub fn state(&self) -> TunnelState {
-        self.state.borrow().clone()
+        self.inner.state.borrow().clone()
     }
 
     /// Returns a receiver that is notified when the state of the tunnel changes.
     pub fn watch_state(&self) -> watch::Receiver<TunnelState> {
-        self.state.clone()
+        self.inner.state.clone()
     }
 
     /// Waits until the tunnel is open. Returns the reason if it could not be opened.
     pub async fn connected(&self) -> Result<(), String> {
-        let mut state = self.state.clone();
+        let mut state = self.inner.state.clone();
         let res = state
             .wait_for(|state| !matches!(state, TunnelState::Connecting))
             .await;
@@ -160,12 +198,6 @@ impl TunnelLink {
     }
 }
 
-impl Drop for TunnelLink {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
-
 struct Actor {
     target: SocketAddrV4,
     config: TunnelConfig,
@@ -173,6 +205,9 @@ struct Actor {
     outbound: mpsc::Receiver<Bytes>,
     state: watch::Sender<TunnelState>,
     cancel: CancellationToken,
+    /// Removes the tunnel from the socket when the actor is done, so that packets are
+    /// not queued for a tunnel that is gone.
+    _registration: TunnelRegistration,
 }
 
 impl Actor {
@@ -182,7 +217,9 @@ impl Actor {
                 self.state.send_replace(TunnelState::Closed("closed".to_string()));
                 return;
             }
-            res = self.connect() => res,
+            res = time::timeout(CONNECT_TIMEOUT, self.connect()) => {
+                res.unwrap_or_else(|_| Err("timed out".to_string()))
+            }
         };
         let reason = match conn {
             Ok(conn) => {
@@ -200,7 +237,8 @@ impl Actor {
         // The relay is addressed by IP. Its certificate is verified against that IP.
         let url = format!("https://{}:{}/", self.target.ip(), self.config.tcp_port);
         let url = Url::parse(&url).map_err(|err| err.to_string())?;
-        let mut dialer = WsDialer::new(url, DnsResolver::new(), MAX_TUNNEL_FRAME_SIZE)
+        let resolver = self.config.dns_resolver.clone();
+        let mut dialer = WsDialer::new(url, resolver, MAX_TUNNEL_FRAME_SIZE)
             .tls_client_config(self.config.tls_config.clone());
         if let Some(proxy_url) = &self.config.proxy_url {
             dialer = dialer.proxy_url(proxy_url.clone());
@@ -223,20 +261,11 @@ impl Actor {
                     return "closed".to_string();
                 }
                 first = self.outbound.recv() => {
-                    // The registration holds a sender, this does not end.
+                    // The socket holds a sender for as long as the tunnel is registered.
                     let Some(first) = first else {
                         return "closed".to_string();
                     };
-                    let write = async {
-                        conn.feed(first).await?;
-                        for _ in 1..WRITE_BATCH {
-                            match self.outbound.try_recv() {
-                                Ok(packet) => conn.feed(packet).await?,
-                                Err(_) => break,
-                            }
-                        }
-                        conn.flush().await
-                    };
+                    let write = write_batch(&mut conn, first, &mut self.outbound, WRITE_BATCH);
                     if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
                         return "write failed".to_string();
                     }

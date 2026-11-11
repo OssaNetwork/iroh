@@ -37,8 +37,8 @@ const INBOUND_QUEUE_DEPTH: usize = 1024;
 pub(super) struct Shared {
     /// Where to send packets for each connected relay.
     links: RwLock<HashMap<RelayIndex, mpsc::Sender<Datagram>>>,
-    /// Where to send packets for each open tunnel, by the address the tunnel leads to.
-    tunnels: RwLock<HashMap<SocketAddrV4, mpsc::Sender<Bytes>>>,
+    /// The tunnels, by the address each leads to.
+    tunnels: RwLock<HashMap<SocketAddrV4, TunnelEntry>>,
     /// Given to every link to deliver the packets it receives.
     inbound: mpsc::Sender<Inbound>,
     /// The index the next link gets, if it is free.
@@ -78,6 +78,42 @@ impl Drop for Registration {
     }
 }
 
+/// What the socket knows about a tunnel.
+struct TunnelEntry {
+    /// Where to send packets for the tunnel.
+    outbound: mpsc::Sender<Bytes>,
+    /// The tunnel, to hand out again while somebody still holds it.
+    link: Weak<super::tunnel::Inner>,
+}
+
+/// Queues the packets of `transmit` for a link, made into messages by `message`.
+///
+/// A transmit can carry several packets of `segment_size` bytes. A packet that does not
+/// fit the queue is dropped, which is loss like any other.
+fn queue_segments<T>(
+    queue: &mpsc::Sender<T>,
+    transmit: &Transmit<'_>,
+    message: impl Fn(Bytes) -> T,
+) {
+    let segment_size = transmit
+        .segment_size
+        .unwrap_or(transmit.contents.len())
+        .max(1);
+    for segment in transmit.contents.chunks(segment_size) {
+        match queue.try_send(message(Bytes::copy_from_slice(segment))) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!("queue of the link is full, dropping packet");
+            }
+            // The link gave up or was closed. No need to copy the other segments.
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                trace!("the link is closed, dropping packet");
+                break;
+            }
+        }
+    }
+}
+
 /// Removes a tunnel from its socket when dropped.
 #[derive(Debug)]
 pub(super) struct TunnelRegistration {
@@ -96,7 +132,7 @@ impl Drop for TunnelRegistration {
                 .unwrap_or_else(|err| err.into_inner());
             if tunnels
                 .get(&self.target)
-                .is_some_and(|sender| sender.same_channel(&self.sender))
+                .is_some_and(|tunnel| tunnel.outbound.same_channel(&self.sender))
             {
                 tunnels.remove(&self.target);
             }
@@ -289,21 +325,51 @@ impl RelaySocketHandle {
     /// before the tunnel is up are held back, up to a few, so the QUIC handshake can
     /// start right away. The link does not reconnect.
     ///
-    /// A tunnel to the same target that is still open is replaced.
+    /// There is one tunnel per target. If a tunnel to `target` is open or being opened,
+    /// a link to that tunnel is returned and `config` is not used.
     ///
     /// Must be called from within a tokio runtime.
     pub fn open_tunnel(&self, target: SocketAddrV4, config: TunnelConfig) -> TunnelLink {
-        let (link, outbound) = TunnelLink::spawn(
+        let mut tunnels = self
+            .shared
+            .tunnels
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(link) = tunnels
+            .get(&target)
+            .and_then(|tunnel| TunnelLink::upgrade(&tunnel.link))
+        {
+            return link;
+        }
+        let (outbound_tx, outbound_rx) = TunnelLink::outbound_queue();
+        let registration =
+            TunnelRegistration::new(Arc::downgrade(&self.shared), target, outbound_tx.clone());
+        // The entry is in place before the task runs, which removes it when it is done.
+        // A task that can not be spawned drops the registration while the lock is held:
+        // release the lock first.
+        tunnels.insert(
+            target,
+            TunnelEntry {
+                outbound: outbound_tx,
+                link: Weak::new(),
+            },
+        );
+        drop(tunnels);
+        let link = TunnelLink::spawn(
             target,
             config,
             self.shared.inbound.clone(),
-            Arc::downgrade(&self.shared),
+            outbound_rx,
+            registration,
         );
-        self.shared
+        let mut tunnels = self
+            .shared
             .tunnels
             .write()
-            .unwrap_or_else(|err| err.into_inner())
-            .insert(target, outbound);
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(tunnel) = tunnels.get_mut(&target) {
+            tunnel.link = link.downgrade();
+        }
         link
     }
 }
@@ -387,29 +453,7 @@ impl UdpSender for RelaySender {
                     // from the loss.
                     return Poll::Ready(Ok(()));
                 };
-                // A transmit can carry several packets of `segment_size` bytes.
-                let segment_size = transmit
-                    .segment_size
-                    .unwrap_or(transmit.contents.len())
-                    .max(1);
-                for segment in transmit.contents.chunks(segment_size) {
-                    let datagram = Datagram {
-                        remote,
-                        payload: Bytes::copy_from_slice(segment),
-                    };
-                    match link.try_send(datagram) {
-                        Ok(()) => {}
-                        // A full queue is loss like any other.
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            trace!("relay link queue full, dropping packet");
-                        }
-                        // The link gave up or was closed.
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            trace!("relay link is closed, dropping packet");
-                            break;
-                        }
-                    }
-                }
+                queue_segments(link, transmit, |payload| Datagram { remote, payload });
                 Poll::Ready(Ok(()))
             }
             PathAddr::Tunnel { target } => {
@@ -421,15 +465,7 @@ impl UdpSender for RelaySender {
                 let Some(tunnel) = tunnels.get(&target) else {
                     return Poll::Ready(Ok(()));
                 };
-                let segment_size = transmit
-                    .segment_size
-                    .unwrap_or(transmit.contents.len())
-                    .max(1);
-                for segment in transmit.contents.chunks(segment_size) {
-                    if tunnel.try_send(Bytes::copy_from_slice(segment)).is_err() {
-                        trace!("tunnel queue full, dropping packet");
-                    }
-                }
+                queue_segments(&tunnel.outbound, transmit, |payload| payload);
                 Poll::Ready(Ok(()))
             }
             // A synthetic address this version does not understand. There is nowhere to

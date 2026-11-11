@@ -75,6 +75,12 @@ Dialers have nothing but the IP address to verify the relay against. Use
 `cert_mode = "Manual"` or `"Reloading"` with a certificate issued for the IP
 address.
 
+Anyone can open a tunnel, as anyone can send UDP packets to the port. When a
+client has `max_tunnels` tunnels, a new one replaces the oldest tunnel the
+client never sent a packet into. A tunnel that carries no forwarded packets
+for two minutes is closed, so the QUIC connection inside needs a keep-alive
+interval shorter than that.
+
 The dialer needs code for this, a stock QUIC client only speaks UDP. See
 `RelaySocketHandle::open_tunnel` and `race_udp_and_tunnel` in the client.
 

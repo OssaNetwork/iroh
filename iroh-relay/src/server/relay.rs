@@ -23,7 +23,7 @@ use std::{
     ops::RangeInclusive,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -58,7 +58,7 @@ use crate::{
             ClientControl, ClientFrame, DATAGRAM_HEADER_LEN, Datagram, DhtStatus, ErrorCode,
             MAX_PACKET_SIZE, RelayControl, RelayFrame, RemoteAddr,
         },
-        streams::BytesStreamSink,
+        streams::{BytesStreamSink, write_batch},
     },
 };
 
@@ -92,8 +92,12 @@ const TUNNEL_QUEUE_DEPTH: usize = 128;
 
 /// How long a tunnel may carry no packets before the relay closes it.
 ///
-/// A QUIC connection with keep-alives never lets its tunnel idle this long.
+/// Only packets that were forwarded count, in either direction. A QUIC connection with
+/// keep-alives never lets its tunnel idle this long.
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a new tunnel has to deliver its first packet to the client.
+const TUNNEL_FIRST_PACKET_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The size of the buffers packets are received into.
 ///
@@ -188,6 +192,8 @@ pub enum AcceptError {
 pub enum TunnelError {
     #[error("no allocation has port {port}")]
     UnknownPort { port: u16 },
+    #[error("the relay does not serve tunnels")]
+    Disabled,
     #[error("too many tunnels are open to the allocation")]
     TooManyTunnels,
 }
@@ -275,11 +281,38 @@ struct AllocationShared {
     attached: Mutex<Option<Attachment>>,
     /// The tunnels of dialers that can not reach the socket over UDP, by the address that
     /// identifies each to the client.
-    tunnels: Mutex<HashMap<SocketAddrV4, mpsc::Sender<Bytes>>>,
+    tunnels: Mutex<HashMap<SocketAddrV4, TunnelEntry>>,
     max_tunnels: usize,
     /// Cancelled when the allocation is released. Closes its tunnels.
     released: CancellationToken,
     metrics: Arc<Metrics>,
+}
+
+/// What an allocation knows about one of its tunnels.
+#[derive(Debug)]
+struct TunnelEntry {
+    /// Packets of the client for the dialer.
+    outbound: mpsc::Sender<Bytes>,
+    /// When the tunnel was opened.
+    opened: Instant,
+    /// Whether the client ever sent a packet into the tunnel.
+    answered: Arc<AtomicBool>,
+    /// Cancelled to close the tunnel in favour of a newer one.
+    evicted: CancellationToken,
+}
+
+/// Returns the tunnel to close to make room for a new one: the oldest one the client
+/// never answered. `None` if the client answered all of them.
+///
+/// Anyone can open tunnels, without authenticating. Tunnels the client is talking
+/// through are kept, the others have to make room, so that tunnels that carry nothing
+/// can not keep real dialers out.
+fn evictable_tunnel(tunnels: &HashMap<SocketAddrV4, TunnelEntry>) -> Option<SocketAddrV4> {
+    tunnels
+        .iter()
+        .filter(|(_, tunnel)| !tunnel.answered.load(Ordering::Relaxed))
+        .min_by_key(|(_, tunnel)| tunnel.opened)
+        .map(|(addr, _)| *addr)
 }
 
 /// The link from an allocation to the control channel that currently serves it.
@@ -383,10 +416,12 @@ impl AllocationShared {
 
     /// Writes a packet of the client to the tunnel of a remote party.
     fn send_to_tunnel(&self, remote: RemoteAddr, payload: Bytes) {
-        let tunnels = lock(&self.tunnels);
         // The address of a tunnelled remote party is only a name for its tunnel. Without
         // the tunnel there is nothing to send to.
-        let Some(tunnel) = tunnels.get(&remote.addr) else {
+        let tunnel = lock(&self.tunnels)
+            .get(&remote.addr)
+            .map(|tunnel| (tunnel.outbound.clone(), tunnel.answered.clone()));
+        let Some((outbound, answered)) = tunnel else {
             self.metrics.packets_dropped_invalid.inc();
             return;
         };
@@ -394,8 +429,9 @@ impl AllocationShared {
             return;
         }
         let len = payload.len();
-        match tunnel.try_send(payload) {
+        match outbound.try_send(payload) {
             Ok(()) => {
+                answered.store(true, Ordering::Relaxed);
                 self.metrics.packets_outbound.inc();
                 self.metrics.bytes_outbound.inc_by(len as u64);
             }
@@ -563,29 +599,64 @@ impl Relay {
         lock(&self.0.state).allocator.owner_of(port).is_some()
     }
 
-    /// Attaches the tunnel of a dialer to the allocation with the public port `port`.
-    ///
-    /// `peer` is the source address of the dialer's connection to the relay. It names the
-    /// dialer to the client, which sees a remote party at that address, marked as
-    /// tunnelled.
-    ///
-    /// Run the returned tunnel with [`Tunnel::run`]. Anyone may open a tunnel, as anyone
-    /// may send UDP packets to the port. The traffic policy applies to both alike.
-    pub fn open_tunnel(&self, port: u16, peer: SocketAddr) -> Result<Tunnel, TunnelError> {
-        let inner = &self.0;
-        let state = lock(&inner.state);
+    /// Returns the allocation with the public port `port`.
+    fn allocation_on(&self, port: u16) -> Result<Arc<AllocationShared>, TunnelError> {
+        let state = lock(&self.0.state);
         let shared = state
             .allocator
             .owner_of(port)
             .and_then(|identity| state.allocations.get(identity))
             .map(|allocation| allocation.shared.clone())
             .ok_or_else(|| e!(TunnelError::UnknownPort { port }))?;
-        drop(state);
+        if shared.max_tunnels == 0 {
+            return Err(e!(TunnelError::Disabled));
+        }
+        Ok(shared)
+    }
+
+    /// Returns whether a tunnel to the allocation with the public port `port` could be
+    /// opened right now.
+    ///
+    /// Call this before agreeing to a tunnel, so that a dialer is told that there is no
+    /// tunnel for it before it starts using one.
+    pub fn check_tunnel(&self, port: u16) -> Result<(), TunnelError> {
+        let shared = self.allocation_on(port)?;
+        let tunnels = lock(&shared.tunnels);
+        if tunnels.len() >= shared.max_tunnels && evictable_tunnel(&tunnels).is_none() {
+            return Err(e!(TunnelError::TooManyTunnels));
+        }
+        Ok(())
+    }
+
+    /// Attaches the tunnel of a dialer to the allocation with the public port `port`.
+    ///
+    /// `peer` is the source address of the dialer's connection to the relay. It names the
+    /// dialer to the client, which sees a remote party at that address, marked as
+    /// tunnelled. Behind a proxy that is the address of the proxy.
+    ///
+    /// Run the returned tunnel with [`Tunnel::run`]. Anyone may open a tunnel, as anyone
+    /// may send UDP packets to the port. The traffic policy applies to both alike.
+    ///
+    /// When the allocation has as many tunnels as it may have, the oldest tunnel the
+    /// client never sent a packet into is closed to make room. If the client answered
+    /// all of them the new tunnel is refused.
+    pub fn open_tunnel(&self, port: u16, peer: SocketAddr) -> Result<Tunnel, TunnelError> {
+        let inner = &self.0;
+        let shared = self.allocation_on(port)?;
 
         let mut tunnels = lock(&shared.tunnels);
         if tunnels.len() >= shared.max_tunnels {
-            inner.metrics.tunnels_rejected.inc();
-            return Err(e!(TunnelError::TooManyTunnels));
+            let evicted = evictable_tunnel(&tunnels).and_then(|addr| tunnels.remove(&addr));
+            match evicted {
+                Some(tunnel) => {
+                    tunnel.evicted.cancel();
+                    inner.metrics.tunnels_evicted.inc();
+                }
+                None => {
+                    inner.metrics.tunnels_rejected.inc();
+                    return Err(e!(TunnelError::TooManyTunnels));
+                }
+            }
         }
         let addr = match peer {
             SocketAddr::V4(addr) if !tunnels.contains_key(&addr) => addr,
@@ -598,15 +669,26 @@ impl Relay {
             SocketAddr::V4(_) => inner.made_up_tunnel_addr(&tunnels),
         };
         let (outbound_tx, outbound_rx) = mpsc::channel(TUNNEL_QUEUE_DEPTH);
-        tunnels.insert(addr, outbound_tx);
+        let evicted = CancellationToken::new();
+        tunnels.insert(
+            addr,
+            TunnelEntry {
+                outbound: outbound_tx.clone(),
+                opened: Instant::now(),
+                answered: Arc::default(),
+                evicted: evicted.clone(),
+            },
+        );
         drop(tunnels);
         inner.metrics.tunnels_opened.inc();
         Ok(Tunnel {
             remote: RemoteAddr::tunnel(addr),
             allocation: Arc::downgrade(&shared),
             released: shared.released.clone(),
+            evicted,
             shutdown: inner.shutdown.clone(),
             outbound: outbound_rx,
+            entry: outbound_tx,
             metrics: inner.metrics.clone(),
         })
     }
@@ -889,10 +971,7 @@ impl Inner {
     ///
     /// The address lies in 240.0.0.0/4, which is reserved and never the source of a real
     /// packet.
-    fn made_up_tunnel_addr(
-        &self,
-        tunnels: &HashMap<SocketAddrV4, mpsc::Sender<Bytes>>,
-    ) -> SocketAddrV4 {
+    fn made_up_tunnel_addr(&self, tunnels: &HashMap<SocketAddrV4, TunnelEntry>) -> SocketAddrV4 {
         loop {
             let n = self.next_tunnel_name.fetch_add(1, Ordering::Relaxed);
             let ip = Ipv4Addr::from(0xf000_0000 | (n & 0x0fff_ffff));
@@ -1105,16 +1184,7 @@ async fn serve<S: BytesStreamSink>(io: &mut S, attached: &mut Attached, relay: &
                 let Some(first) = first else {
                     return Exit::superseded();
                 };
-                let write = async {
-                    io.feed(first).await?;
-                    for _ in 1..WRITE_BATCH {
-                        match attached.inbound.try_recv() {
-                            Ok(frame) => io.feed(frame).await?,
-                            Err(_) => break,
-                        }
-                    }
-                    io.flush().await
-                };
+                let write = write_batch(io, first, &mut attached.inbound, WRITE_BATCH);
                 if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
                     return Exit::silent("write failed");
                 }
@@ -1175,16 +1245,27 @@ pub struct Tunnel {
     remote: RemoteAddr,
     allocation: Weak<AllocationShared>,
     released: CancellationToken,
+    /// Cancelled when the tunnel has to make room for a newer one.
+    evicted: CancellationToken,
     shutdown: CancellationToken,
     /// Packets of the client for the dialer.
     outbound: mpsc::Receiver<Bytes>,
+    /// The sending end of `outbound`, to recognise this tunnel's entry in the allocation.
+    entry: mpsc::Sender<Bytes>,
     metrics: Arc<Metrics>,
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
         if let Some(allocation) = self.allocation.upgrade() {
-            lock(&allocation.tunnels).remove(&self.remote.addr);
+            let mut tunnels = lock(&allocation.tunnels);
+            // After an eviction the name can belong to a newer tunnel already.
+            if tunnels
+                .get(&self.remote.addr)
+                .is_some_and(|tunnel| tunnel.outbound.same_channel(&self.entry))
+            {
+                tunnels.remove(&self.remote.addr);
+            }
         }
         self.metrics.tunnels_closed.inc();
     }
@@ -1211,28 +1292,22 @@ impl Tunnel {
     }
 
     async fn serve<S: BytesStreamSink>(&mut self, io: &mut S) -> &'static str {
-        let idle = time::sleep(TUNNEL_IDLE_TIMEOUT);
+        // A tunnel that delivers nothing is closed soon. Only forwarded packets count:
+        // a dialer can not keep its tunnel open with packets the relay drops.
+        let idle = time::sleep(TUNNEL_FIRST_PACKET_TIMEOUT);
         tokio::pin!(idle);
         loop {
             tokio::select! {
                 _ = self.released.cancelled() => return "the allocation was released",
+                _ = self.evicted.cancelled() => return "made room for a newer tunnel",
                 _ = self.shutdown.cancelled() => return "relay is shutting down",
                 _ = &mut idle => return "idle",
                 first = self.outbound.recv() => {
-                    // The sender lives in the allocation.
+                    // `self.entry` is a sender, so this does not end.
                     let Some(first) = first else {
                         return "the allocation was released";
                     };
-                    let write = async {
-                        io.feed(first).await?;
-                        for _ in 1..WRITE_BATCH {
-                            match self.outbound.try_recv() {
-                                Ok(packet) => io.feed(packet).await?,
-                                Err(_) => break,
-                            }
-                        }
-                        io.flush().await
-                    };
+                    let write = write_batch(io, first, &mut self.outbound, WRITE_BATCH);
                     if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
                         return "write failed";
                     }
@@ -1244,7 +1319,6 @@ impl Tunnel {
                         Some(Err(_)) => return "read failed",
                         None => return "closed by the dialer",
                     };
-                    idle.as_mut().reset(Instant::now() + TUNNEL_IDLE_TIMEOUT);
                     // The tunnel must not keep the allocation alive.
                     let Some(allocation) = self.allocation.upgrade() else {
                         return "the allocation was released";
@@ -1252,6 +1326,7 @@ impl Tunnel {
                     if !allocation.accepts_inbound(self.remote, &packet) {
                         continue;
                     }
+                    idle.as_mut().reset(Instant::now() + TUNNEL_IDLE_TIMEOUT);
                     let mut frame = BytesMut::with_capacity(DATAGRAM_HEADER_LEN + packet.len());
                     frame.put_slice(&Datagram::header(self.remote));
                     frame.put_slice(&packet);
