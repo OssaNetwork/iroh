@@ -2,7 +2,10 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
     time::Duration,
 };
 
@@ -34,8 +37,11 @@ fn allocations(release_timeout: Duration) -> AllocationConfig {
         Arc::new(ForwardAll),
     );
     config.release_timeout = release_timeout;
-    // Stay clear of ports other tests and services on the machine use.
-    config.ports = 20_000..=60_000;
+    // Every relay gets its own ports. The tests run in parallel in one process, and the
+    // same identity prefers the same port on every relay with the same range.
+    static NEXT_RANGE: AtomicU16 = AtomicU16::new(0);
+    let start = 20_000 + 500 * NEXT_RANGE.fetch_add(1, Ordering::Relaxed);
+    config.ports = start..=start + 499;
     config
 }
 
@@ -383,6 +389,32 @@ async fn zero_release_timeout_releases_immediately() {
 }
 
 #[tokio::test]
+async fn immediate_reconnect_gets_the_same_port() {
+    // Without a release timeout the port is freed when the client disconnects, while its
+    // socket closes a moment later. A client that returns in between waits for it.
+    let server = spawn_relay(allocations(Duration::ZERO)).await;
+    let (mut bob, addr) = connect(&server, "bob").await;
+    for _ in 0..20 {
+        drop(bob);
+        let (conn, new_addr) = connect(&server, "bob").await;
+        assert_eq!(new_addr, addr);
+        bob = conn;
+    }
+    assert_eq!(server.metrics().server.allocations_bind_failed.get(), 0);
+}
+
+#[tokio::test]
+async fn rejects_invalid_packet_size_limit() {
+    let mut config = allocations(Duration::ZERO);
+    config.max_packet_size = 0;
+    let mut relay = testing::relay_config();
+    relay.allocations = Some(config);
+    let mut server_config = ServerConfig::default();
+    server_config.relay = Some(relay);
+    assert!(Server::spawn(server_config).await.is_err());
+}
+
+#[tokio::test]
 async fn second_control_channel_takes_over() {
     let server = spawn_relay(allocations(Duration::from_secs(30))).await;
     let (mut first, addr) = connect(&server, "bob").await;
@@ -498,10 +530,12 @@ async fn channel_binding_matches_on_both_ends() {
 async fn shutdown_closes_control_channels() {
     let server = spawn_relay(allocations(Duration::from_secs(30))).await;
     let (mut bob, bob_addr) = connect(&server, "bob").await;
+    let metrics = server.metrics().clone();
     server.shutdown().await.unwrap();
     assert!(recv(&mut bob).await.is_none());
     eventually("the port is free", || {
         std::net::UdpSocket::bind(bob_addr).is_ok()
     })
     .await;
+    assert_eq!(metrics.server.allocations_released.get(), 1);
 }

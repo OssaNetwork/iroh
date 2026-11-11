@@ -62,7 +62,7 @@ pub use self::{
     http_server::{Handlers, RelayService},
     metrics::{Metrics, RelayMetrics},
     policy::{AllocationPolicy, Direction, ForwardAll, Packet, TrafficPolicy, Verdict},
-    relay::{AllocationConfig, ControlConnection, Relay},
+    relay::{AllocationConfig, ControlConnection, InvalidConfig, Relay},
     resolver::{DEFAULT_CERT_RELOAD_INTERVAL, reloading_resolver},
 };
 
@@ -334,8 +334,8 @@ pub enum SpawnError {
     TlsHeaderParse { source: InvalidHeaderValue },
     #[error("Failed to bind TcpListener")]
     BindTlsListener { source: std::io::Error },
-    #[error("Invalid port range for allocations")]
-    InvalidPortRange { source: InvalidPortRange },
+    #[error("Invalid configuration of the allocations")]
+    InvalidAllocationConfig { source: InvalidConfig },
     #[error("Failed to build ACME client TLS config")]
     AcmeClientTlsConfig {
         #[error(std_err)]
@@ -416,7 +416,7 @@ impl Server {
                     .allocations
                     .map(|config| Relay::new(config, metrics.server.clone()))
                     .transpose()
-                    .map_err(|err| e!(SpawnError::InvalidPortRange, err))?;
+                    .map_err(|err| e!(SpawnError::InvalidAllocationConfig, err))?;
                 let mut builder = http_server::ServerBuilder::new(relay_bind_addr)
                     .relay(relay)
                     .metrics(metrics.server.clone())

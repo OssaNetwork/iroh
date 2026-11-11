@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::RangeInclusive,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 
@@ -49,7 +49,7 @@ use crate::{
     protos::{
         relay::{
             ClientControl, ClientFrame, DATAGRAM_HEADER_LEN, Datagram, DhtStatus, ErrorCode,
-            RelayControl, RelayFrame, RemoteAddr,
+            MAX_PACKET_SIZE, RelayControl, RelayFrame, RemoteAddr,
         },
         streams::BytesStreamSink,
     },
@@ -68,6 +68,14 @@ const WRITE_BATCH: usize = 64;
 
 /// How many ports are tried when binding the socket of a new allocation fails.
 const MAX_BIND_ATTEMPTS: usize = 8;
+
+/// How long to wait for a socket the relay is closing to release its port, and how often
+/// to look.
+const CLOSING_WAIT: Duration = Duration::from_secs(1);
+const CLOSING_POLL: Duration = Duration::from_millis(5);
+
+/// How long the reader of an allocation pauses after its socket reported an error.
+const READ_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 
 /// The size of the buffers packets are received into.
 ///
@@ -142,8 +150,24 @@ pub enum AcceptError {
     Rejected { reason: String },
     #[error("no port is available")]
     NoPortAvailable,
+    #[error("failed to bind the socket of the allocation")]
+    Bind {
+        #[error(std_err)]
+        source: std::io::Error,
+    },
     #[error("the relay is shutting down")]
     Shutdown,
+}
+
+/// The configuration of a [`Relay`] is not usable.
+#[stack_error(derive, add_meta, from_sources)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum InvalidConfig {
+    #[error(transparent)]
+    PortRange { source: InvalidPortRange },
+    #[error("max_packet_size must be between 1 and {MAX_PACKET_SIZE}, got {max_packet_size}")]
+    MaxPacketSize { max_packet_size: usize },
 }
 
 /// The relay.
@@ -170,6 +194,30 @@ struct Inner {
 struct State {
     allocator: PortAllocator,
     allocations: HashMap<ClientId, Allocation>,
+    /// Allocations that were released but whose socket may still be open.
+    ///
+    /// A socket closes once the reader task and the last control channel have let go of
+    /// it, which is shortly after the allocation is released, not at that moment. Until
+    /// then its port can not be bound again.
+    closing: Vec<(u16, Weak<AllocationShared>)>,
+    /// Set by [`Relay::shutdown`], no allocations are created afterwards.
+    shutdown: bool,
+}
+
+impl State {
+    /// Removes the allocation of `identity`. Its socket closes shortly after.
+    fn remove_allocation(&mut self, identity: &ClientId) {
+        if let Some(allocation) = self.allocations.remove(identity) {
+            self.closing
+                .push((allocation.shared.port, Arc::downgrade(&allocation.shared)));
+        }
+    }
+
+    /// Returns whether the relay is still closing a socket on `port`.
+    fn is_closing(&mut self, port: u16) -> bool {
+        self.closing.retain(|(_, shared)| shared.strong_count() > 0);
+        self.closing.iter().any(|(closing, _)| *closing == port)
+    }
 }
 
 /// One client's UDP socket on a public port.
@@ -261,16 +309,12 @@ impl AllocationShared {
             || addr.ip().is_unspecified()
             || addr.ip().is_broadcast()
             || addr.ip().is_multicast();
-        if invalid || payload.is_empty() || payload.len() > self.max_packet_size {
+        // Tunnelled remote parties are not served yet.
+        if invalid || remote.tunnel || payload.is_empty() || payload.len() > self.max_packet_size {
             self.metrics.packets_dropped_invalid.inc();
             return;
         }
         if !self.allowed(Direction::Outbound, remote, &payload) {
-            return;
-        }
-        if remote.tunnel {
-            // Tunnelled remote parties are not served yet.
-            self.metrics.packets_dropped_invalid.inc();
             return;
         }
         match self.socket.try_send_to(&payload, SocketAddr::V4(addr)) {
@@ -309,10 +353,13 @@ impl AllocationShared {
             let (len, from) = match res {
                 Ok(res) => res,
                 Err(err) => {
-                    if err.kind() != std::io::ErrorKind::WouldBlock {
-                        trace!("failed to receive packet: {err:#}");
-                    }
                     buf.clear();
+                    if err.kind() != std::io::ErrorKind::WouldBlock {
+                        // The socket stays readable after an error. Pause, so that an
+                        // error that persists does not spin this task.
+                        trace!("failed to receive packet: {err:#}");
+                        time::sleep(READ_ERROR_BACKOFF).await;
+                    }
                     continue;
                 }
             };
@@ -339,13 +386,21 @@ impl Relay {
     /// Creates a relay.
     ///
     /// Must be called from within a tokio runtime.
-    pub fn new(config: AllocationConfig, metrics: Arc<Metrics>) -> Result<Self, InvalidPortRange> {
+    pub fn new(config: AllocationConfig, metrics: Arc<Metrics>) -> Result<Self, InvalidConfig> {
+        n0_error::ensure!(
+            (1..=MAX_PACKET_SIZE).contains(&config.max_packet_size),
+            InvalidConfig::MaxPacketSize {
+                max_packet_size: config.max_packet_size
+            }
+        );
         let allocator = PortAllocator::new(config.ports.clone(), config.release_timeout)?;
         let inner = Arc::new(Inner {
             config,
             state: Mutex::new(State {
                 allocator,
                 allocations: HashMap::new(),
+                closing: Vec::new(),
+                shutdown: false,
             }),
             expiry_changed: Arc::new(Notify::new()),
             shutdown: CancellationToken::new(),
@@ -414,9 +469,16 @@ impl Relay {
     }
 
     /// Closes all control channels and releases all allocations.
+    ///
+    /// No allocations are created afterwards.
     pub fn shutdown(&self) {
+        let mut state = lock(&self.0.state);
+        state.shutdown = true;
         self.0.shutdown.cancel();
-        lock(&self.0.state).allocations.clear();
+        let released = state.allocations.len();
+        state.allocations.clear();
+        state.allocator.clear();
+        self.0.metrics.allocations_released.inc_by(released as u64);
     }
 
     /// Accepts a control channel that a client opened.
@@ -448,7 +510,9 @@ impl Relay {
                     AcceptError::Rejected { .. } => Some(ErrorCode::Unauthorized),
                     AcceptError::Protocol { .. } => Some(ErrorCode::Protocol),
                     AcceptError::NoPortAvailable { .. } => Some(ErrorCode::NoPortAvailable),
-                    AcceptError::Shutdown { .. } => Some(ErrorCode::Internal),
+                    AcceptError::Bind { .. } | AcceptError::Shutdown { .. } => {
+                        Some(ErrorCode::Internal)
+                    }
                     _ => None,
                 };
                 if let Some(code) = code {
@@ -505,7 +569,7 @@ impl Relay {
             }
         };
 
-        let attached = self.attach(&identity)?;
+        let attached = self.attach_when_free(&identity).await?;
         let addr = SocketAddrV4::new(self.0.config.public_ip, attached.shared.port);
         debug!(%identity, %addr, "client attached");
         // If this fails `attached` is dropped, which detaches the client again.
@@ -516,16 +580,36 @@ impl Relay {
         Ok(attached)
     }
 
+    /// Like [`Self::attach`], but waits for a port the relay is still closing.
+    async fn attach_when_free(&self, identity: &ClientId) -> Result<Attached, AcceptError> {
+        let deadline = Instant::now() + CLOSING_WAIT;
+        loop {
+            match self.attach(identity) {
+                Ok(Some(attached)) => return Ok(attached),
+                Ok(None) if Instant::now() < deadline => time::sleep(CLOSING_POLL).await,
+                Ok(None) => {
+                    let err = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+                    return Err(e!(AcceptError::Bind, err));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Gives `identity` its allocation and makes a new control channel its owner.
-    fn attach(&self, identity: &ClientId) -> Result<Attached, AcceptError> {
+    ///
+    /// Returns `None` if the port of the identity belonged to an allocation that was
+    /// just released and whose socket is not closed yet. Try again shortly.
+    fn attach(&self, identity: &ClientId) -> Result<Option<Attached>, AcceptError> {
         let inner = &self.0;
-        if inner.shutdown.is_cancelled() {
+        let mut state = lock(&inner.state);
+        if state.shutdown {
             return Err(e!(AcceptError::Shutdown));
         }
-        let mut state = lock(&inner.state);
         let now = Instant::now();
         inner.expire(&mut state, now);
 
+        let mut last_error = None;
         for _ in 0..MAX_BIND_ATTEMPTS {
             let lease = match state.allocator.acquire(identity, now) {
                 Ok(lease) => lease,
@@ -540,21 +624,41 @@ impl Relay {
                     inner.metrics.allocations_resumed.inc();
                     allocation.shared.clone()
                 }
-                None => match inner.bind(identity, lease.port) {
-                    Ok(allocation) => {
-                        inner.metrics.allocations_created.inc();
-                        let shared = allocation.shared.clone();
-                        state.allocations.insert(identity.clone(), allocation);
-                        shared
+                None => {
+                    // Look before binding: the socket may close between a failed bind
+                    // and a look afterwards.
+                    let closing = state.is_closing(lease.port);
+                    match inner.bind(identity, lease.port) {
+                        Ok(allocation) => {
+                            inner.metrics.allocations_created.inc();
+                            let shared = allocation.shared.clone();
+                            state.allocations.insert(identity.clone(), allocation);
+                            shared
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                            if closing {
+                                // The port is taken by a socket of ours that is about to
+                                // close. It is the identity's preferred port, wait for it.
+                                state.allocator.abandon(identity, lease.generation);
+                                return Ok(None);
+                            }
+                            // Somebody else uses the port, try the next one.
+                            debug!(port = lease.port, "port of new allocation is in use");
+                            state
+                                .allocator
+                                .mark_unusable(identity, lease.generation, now);
+                            last_error = Some(err);
+                            continue;
+                        }
+                        Err(err) => {
+                            // Not the port's fault, another port would fail the same way.
+                            warn!(port = lease.port, "failed to bind allocation: {err:#}");
+                            state.allocator.abandon(identity, lease.generation);
+                            inner.metrics.allocations_bind_failed.inc();
+                            return Err(e!(AcceptError::Bind, err));
+                        }
                     }
-                    Err(err) => {
-                        debug!(port = lease.port, "failed to bind allocation: {err:#}");
-                        state
-                            .allocator
-                            .mark_unusable(identity, lease.generation, now);
-                        continue;
-                    }
-                },
+                }
             };
 
             let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
@@ -569,16 +673,17 @@ impl Relay {
             }
             // Resuming a held port cancels its release.
             inner.expiry_changed.notify_one();
-            return Ok(Attached {
+            return Ok(Some(Attached {
                 shared,
                 generation: lease.generation,
                 inbound: inbound_rx,
                 superseded,
                 relay: self.clone(),
-            });
+            }));
         }
-        inner.metrics.ports_exhausted.inc();
-        Err(e!(AcceptError::NoPortAvailable))
+        inner.metrics.allocations_bind_failed.inc();
+        let err = last_error.unwrap_or_else(|| std::io::ErrorKind::AddrInUse.into());
+        Err(e!(AcceptError::Bind, err))
     }
 
     /// Ends the ownership of a control channel over its allocation.
@@ -602,7 +707,7 @@ impl Relay {
                 inner.expiry_changed.notify_one();
             }
             Released::Freed => {
-                state.allocations.remove(identity);
+                state.remove_allocation(identity);
                 inner.metrics.allocations_released.inc();
             }
             // A newer control channel owns the allocation.
@@ -616,7 +721,7 @@ impl Inner {
     fn expire(&self, state: &mut State, now: Instant) {
         for (identity, port) in state.allocator.expire(now) {
             debug!(%identity, port, "allocation released");
-            state.allocations.remove(&identity);
+            state.remove_allocation(&identity);
             self.metrics.allocations_released.inc();
         }
     }
@@ -714,20 +819,66 @@ impl<S: BytesStreamSink> ControlConnection<S> {
         let identity = attached.shared.identity.clone();
         let span = info_span!("control", %identity, port = attached.shared.port);
         async {
-            let reason = serve(&mut io, &mut attached, &relay).await;
-            debug!("control channel closed: {reason}");
+            let exit = serve(&mut io, &mut attached, &relay).await;
+            debug!("control channel closed: {}", exit.reason);
+            // Let go of the allocation before saying goodbye, which can take a while if
+            // the client is slow or gone.
+            drop(attached);
+            match exit.goodbye {
+                Goodbye::None => {}
+                Goodbye::Close => {
+                    let _ = time::timeout(WRITE_TIMEOUT, io.close()).await;
+                }
+                Goodbye::Error(code, reason) => send_error(&mut io, code, reason).await,
+            }
         }
         .instrument(span)
         .await;
     }
 }
 
+/// How a control channel ended.
+struct Exit {
+    /// For the log.
+    reason: &'static str,
+    /// What to tell the client.
+    goodbye: Goodbye,
+}
+
+enum Goodbye {
+    /// The connection is broken or the client closed it.
+    None,
+    /// Close the WebSocket.
+    Close,
+    /// Tell the client why, then close the WebSocket.
+    Error(ErrorCode, String),
+}
+
+impl Exit {
+    fn silent(reason: &'static str) -> Self {
+        Self {
+            reason,
+            goodbye: Goodbye::None,
+        }
+    }
+
+    fn superseded() -> Self {
+        Self {
+            reason: "superseded by a newer control channel",
+            goodbye: Goodbye::Error(ErrorCode::Superseded, String::new()),
+        }
+    }
+
+    fn protocol(reason: String) -> Self {
+        Self {
+            reason: "protocol violation",
+            goodbye: Goodbye::Error(ErrorCode::Protocol, reason),
+        }
+    }
+}
+
 /// Runs the control channel, returns why it ended.
-async fn serve<S: BytesStreamSink>(
-    io: &mut S,
-    attached: &mut Attached,
-    relay: &Relay,
-) -> &'static str {
+async fn serve<S: BytesStreamSink>(io: &mut S, attached: &mut Attached, relay: &Relay) -> Exit {
     let shared = attached.shared.clone();
     let mut ping_tracker = PingTracker::default();
     let mut ping_interval = time::interval(PING_INTERVAL);
@@ -737,21 +888,18 @@ async fn serve<S: BytesStreamSink>(
 
     loop {
         tokio::select! {
-            _ = attached.superseded.cancelled() => {
-                send_error(io, ErrorCode::Superseded, String::new()).await;
-                return "superseded by a newer control channel";
-            }
+            _ = attached.superseded.cancelled() => return Exit::superseded(),
             _ = relay.0.shutdown.cancelled() => {
-                let _ = time::timeout(WRITE_TIMEOUT, io.close()).await;
-                return "relay is shutting down";
+                return Exit {
+                    reason: "relay is shutting down",
+                    goodbye: Goodbye::Close,
+                };
             }
-            _ = ping_tracker.timeout() => {
-                return "ping timed out";
-            }
+            _ = ping_tracker.timeout() => return Exit::silent("ping timed out"),
             _ = ping_interval.tick() => {
                 let frame = RelayFrame::Control(RelayControl::Ping(ping_tracker.new_ping()));
                 if !send_frame(io, &frame).await {
-                    return "write failed";
+                    return Exit::silent("write failed");
                 }
             }
             first = attached.inbound.recv() => {
@@ -759,8 +907,7 @@ async fn serve<S: BytesStreamSink>(
                 // only dropped when another control channel replaces it, which can be
                 // seen here before the cancellation is.
                 let Some(first) = first else {
-                    send_error(io, ErrorCode::Superseded, String::new()).await;
-                    return "superseded by a newer control channel";
+                    return Exit::superseded();
                 };
                 let write = async {
                     io.feed(first).await?;
@@ -773,14 +920,14 @@ async fn serve<S: BytesStreamSink>(
                     io.flush().await
                 };
                 if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
-                    return "write failed";
+                    return Exit::silent("write failed");
                 }
             }
             frame = io.next() => {
                 let bytes = match frame {
                     Some(Ok(bytes)) => bytes,
-                    Some(Err(_)) => return "read failed",
-                    None => return "closed by the client",
+                    Some(Err(_)) => return Exit::silent("read failed"),
+                    None => return Exit::silent("closed by the client"),
                 };
                 let reply = match ClientFrame::from_bytes(bytes) {
                     Ok(ClientFrame::Datagram(datagram)) => {
@@ -794,9 +941,7 @@ async fn serve<S: BytesStreamSink>(
                             None
                         }
                         ClientControl::Auth { .. } => {
-                            let reason = "already authenticated".to_string();
-                            send_error(io, ErrorCode::Protocol, reason).await;
-                            return "protocol violation";
+                            return Exit::protocol("already authenticated".to_string());
                         }
                         // The relay does not offer the DHT service.
                         ClientControl::DhtAnnounce { info_hash } => {
@@ -814,15 +959,12 @@ async fn serve<S: BytesStreamSink>(
                         ClientControl::DhtStop { .. } => None,
                     },
                     Err(err) if err.is_unknown_control() => None,
-                    Err(err) => {
-                        send_error(io, ErrorCode::Protocol, err.to_string()).await;
-                        return "protocol violation";
-                    }
+                    Err(err) => return Exit::protocol(err.to_string()),
                 };
                 if let Some(control) = reply
                     && !send_frame(io, &RelayFrame::Control(control)).await
                 {
-                    return "write failed";
+                    return Exit::silent("write failed");
                 }
             }
         }

@@ -458,7 +458,6 @@ struct Inner {
     headers: HeaderMap,
     relay: Option<Relay>,
     metrics: Arc<Metrics>,
-    establish_timeout: Duration,
 }
 
 #[stack_error(derive, add_meta)]
@@ -583,7 +582,7 @@ impl RelayService {
         // Note: This can't possibly be fulfilled until the 101 response
         // is returned below, so it's better to spawn this future instead
         // waiting for it to complete to then return a response.
-        let deadline = Instant::now() + self.0.establish_timeout;
+        let deadline = Instant::now() + ESTABLISH_TIMEOUT;
         tokio::task::spawn(
             async move {
                 let upgraded =
@@ -732,7 +731,6 @@ impl RelayService {
             headers,
             relay,
             metrics,
-            establish_timeout: ESTABLISH_TIMEOUT,
         }))
     }
 
@@ -753,7 +751,8 @@ impl RelayService {
     /// If a `tls_config` is given, will serve the connection using HTTPS, otherwise HTTP.
     ///
     /// A plain HTTP connection is aborted if it is still open after `establish_timeout`.
-    /// A connection that was upgraded to a WebSocket is not affected.
+    /// A connection that was upgraded to a WebSocket is not affected. Its client has 30
+    /// seconds from the upgrade request to authenticate.
     ///
     /// # Example
     ///

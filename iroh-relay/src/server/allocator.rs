@@ -310,6 +310,29 @@ impl PortAllocator {
         self.unusable.insert(port, now + UNUSABLE_COOLDOWN);
     }
 
+    /// Frees the port of `identity` right away, without holding it and without skipping
+    /// it later. Does nothing if `generation` is not the identity's current one.
+    ///
+    /// Use this when the port could not be put to use for a reason that is not the
+    /// port's fault.
+    pub fn abandon(&mut self, identity: &ClientId, generation: u64) {
+        if self
+            .by_identity
+            .get(identity)
+            .is_some_and(|entry| entry.state == (State::Active { generation }))
+        {
+            self.remove(identity);
+        }
+    }
+
+    /// Frees all ports. Excluded ports stay excluded.
+    pub fn clear(&mut self) {
+        self.by_identity.clear();
+        self.by_port.clear();
+        self.held.clear();
+        self.unusable.clear();
+    }
+
     /// Frees all ports whose release timeout has passed by `now`.
     ///
     /// Returns the identities and ports that were freed.
@@ -547,6 +570,23 @@ mod tests {
 
         let later = now + UNUSABLE_COOLDOWN;
         assert_eq!(alloc.acquire(&id("carol"), later).unwrap().port, first.port);
+    }
+
+    #[test]
+    fn abandon_frees_without_cooldown() {
+        let now = Instant::now();
+        let mut alloc = PortAllocator::new(1000..=1000, TIMEOUT).unwrap();
+        let first = alloc.acquire(&id("bob"), now).unwrap();
+        // A stale generation is ignored.
+        alloc.abandon(&id("bob"), first.generation + 1);
+        assert_eq!(alloc.len(), 1);
+        alloc.abandon(&id("bob"), first.generation);
+        assert!(alloc.is_empty());
+        assert_eq!(alloc.acquire(&id("carol"), now).unwrap().port, 1000);
+
+        alloc.clear();
+        assert!(alloc.is_empty());
+        assert_eq!(alloc.next_expiry(), None);
     }
 
     #[test]

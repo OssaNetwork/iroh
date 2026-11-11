@@ -26,6 +26,8 @@ pub struct Metrics {
     pub allocations_released: Counter,
     /// Number of times a client could not get a port because none was free.
     pub ports_exhausted: Counter,
+    /// Number of times a client could not get a port because binding its socket failed.
+    pub allocations_bind_failed: Counter,
 
     /*
      * Metrics about packets
