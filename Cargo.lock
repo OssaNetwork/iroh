@@ -1390,6 +1390,7 @@ dependencies = [
  "noq-proto",
  "percent-encoding",
  "pin-project",
+ "proptest",
  "rand",
  "rcgen",
  "reloadable-state",
