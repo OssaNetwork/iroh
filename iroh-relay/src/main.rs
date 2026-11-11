@@ -450,7 +450,10 @@ struct TlsConfig {
     ip: Option<IpAddr>,
     /// Mode for getting a cert.
     ///
-    /// Possible options: 'Manual', 'LetsEncrypt'.
+    /// Possible options: 'Manual', 'Reloading', 'LetsEncrypt', 'LetsEncryptIp'.
+    ///
+    /// 'LetsEncryptIp' obtains a certificate for the relay's IP address instead of a
+    /// hostname, which is what dialers of the TCP fallback verify the relay against.
     cert_mode: CertMode,
     /// Directory to store LetsEncrypt certs or read manual certificates from.
     ///
@@ -472,7 +475,7 @@ struct TlsConfig {
     ///
     /// Default is `true`.
     ///
-    /// Only used when `cert_mode` is `LetsEncrypt`.
+    /// Only used when `cert_mode` is `LetsEncrypt` or `LetsEncryptIp`.
     ///
     /// While in development, LetsEncrypt prefers you to use the staging server. However,
     /// the staging server seems to only use `ECDSA` keys. In their current set up, you can
@@ -485,7 +488,7 @@ struct TlsConfig {
     prod_tls: bool,
     /// The contact email for the tls certificate.
     ///
-    /// Used when `cert_mode` is `LetsEncrypt`.
+    /// Required when `cert_mode` is `LetsEncrypt`, optional when it is `LetsEncryptIp`.
     contact: Option<String>,
     /// **This field should never be manually set**
     ///
@@ -622,6 +625,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Returns the directory URL of the ACME server to use instead of Let's Encrypt, if the
+/// environment asks for one.
+fn acme_url_override() -> Option<String> {
+    std::env::var(ENV_ACME_URL).ok()
+}
+
+/// Returns the TLS configuration that trusts an additional CA for the ACME server's
+/// certificate, if the environment names one.
+///
+/// Useful for testing against a local ACME server such as pebble, whose certificate is
+/// not signed by a publicly trusted CA.
+fn acme_ca_override() -> Result<Option<CaTlsConfig>> {
+    let Ok(ca_path) = std::env::var(ENV_ACME_CA) else {
+        return Ok(None);
+    };
+    let extra_roots = CertificateDer::pem_file_iter(&ca_path)
+        .std_context("failed to read IROH_RELAY_ACME_CA")?
+        .collect::<Result<Vec<_>, _>>()
+        .std_context("failed to parse IROH_RELAY_ACME_CA")?;
+    Ok(Some(CaTlsConfig::default().with_extra_roots(extra_roots)))
+}
+
+/// Returns the contact URL of an ACME account for an email address.
+fn contact_url(email: &str) -> String {
+    format!("mailto:{email}")
+}
+
 /// Loads the certificate configuration. `public_ip` is the address clients advertise, if
 /// the relay accepts clients.
 async fn load_cert_config(
@@ -660,25 +690,16 @@ async fn load_cert_config(
                 .contact
                 .clone()
                 .std_context("LetsEncrypt needs a contact email")?;
-            let acme_config = if let Ok(url) = std::env::var(ENV_ACME_URL) {
-                AcmeConfig::new(url)
-            } else {
-                AcmeConfig::letsencrypt(tls.prod_tls)
+            let acme_config = match acme_url_override() {
+                Some(url) => AcmeConfig::new(url),
+                None => AcmeConfig::letsencrypt(tls.prod_tls),
             };
             let mut acme_config = acme_config
                 .domains(domains)
-                .contact(vec![format!("mailto:{contact}")])
+                .contact(vec![contact_url(&contact)])
                 .cache_path(tls.cert_dir());
-            // Trust an additional CA for the ACME server's TLS certificate. Useful for testing
-            // against a local ACME server such as pebble, whose certificate is not signed by a
-            // publicly trusted CA.
-            if let Ok(ca_path) = std::env::var(ENV_ACME_CA) {
-                let extra_roots = CertificateDer::pem_file_iter(&ca_path)
-                    .std_context("failed to read IROH_RELAY_ACME_CA")?
-                    .collect::<Result<Vec<_>, _>>()
-                    .std_context("failed to parse IROH_RELAY_ACME_CA")?;
-                acme_config =
-                    acme_config.tls_config(CaTlsConfig::default().with_extra_roots(extra_roots));
+            if let Some(tls_config) = acme_ca_override()? {
+                acme_config = acme_config.tls_config(tls_config);
             }
             relay::CertConfig::LetsEncrypt {
                 acme_config,
@@ -690,22 +711,16 @@ async fn load_cert_config(
                 .ip
                 .or(public_ip.map(IpAddr::V4))
                 .std_context("LetsEncryptIp needs tls.ip or allocations.public_ip")?;
-            let mut acme_config = if let Ok(url) = std::env::var(ENV_ACME_URL) {
-                relay::IpAcmeConfig::new(url, ip)
-            } else {
-                relay::IpAcmeConfig::letsencrypt(tls.prod_tls, ip)
+            let mut acme_config = match acme_url_override() {
+                Some(url) => relay::IpAcmeConfig::new(url, ip),
+                None => relay::IpAcmeConfig::letsencrypt(tls.prod_tls, ip),
             };
             acme_config = acme_config.cache_path(tls.cert_dir());
             if let Some(contact) = &tls.contact {
-                acme_config = acme_config.contact(vec![format!("mailto:{contact}")]);
+                acme_config = acme_config.contact(vec![contact_url(contact)]);
             }
-            if let Ok(ca_path) = std::env::var(ENV_ACME_CA) {
-                let extra_roots = CertificateDer::pem_file_iter(&ca_path)
-                    .std_context("failed to read IROH_RELAY_ACME_CA")?
-                    .collect::<Result<Vec<_>, _>>()
-                    .std_context("failed to parse IROH_RELAY_ACME_CA")?;
-                acme_config =
-                    acme_config.tls_config(CaTlsConfig::default().with_extra_roots(extra_roots));
+            if let Some(tls_config) = acme_ca_override()? {
+                acme_config = acme_config.tls_config(tls_config);
             }
             relay::CertConfig::AcmeIp {
                 acme_config,

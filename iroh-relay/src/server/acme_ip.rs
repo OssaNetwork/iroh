@@ -52,8 +52,16 @@ pub const SHORTLIVED_PROFILE: &str = "shortlived";
 pub(super) const CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge/";
 
 /// The delays between attempts to renew a certificate after a failure.
-const MIN_RETRY: Duration = Duration::from_secs(60);
-const MAX_RETRY: Duration = Duration::from_secs(60 * 60);
+///
+/// Every attempt places an order. Certificate authorities limit how often that may
+/// fail: Let's Encrypt allows five failed validations per address and hour. Halfway
+/// through a validity period of days there is time to wait.
+const MIN_RETRY: Duration = Duration::from_secs(15 * 60);
+const MAX_RETRY: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// How long obtaining a certificate may take, from the first request to the ACME server
+/// to the certificate.
+const OBTAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Configuration for obtaining a certificate for an IP address through ACME.
 #[derive(Debug, Clone)]
@@ -163,6 +171,8 @@ pub enum AcmeIpError {
         #[error(std_err)]
         source: io::Error,
     },
+    #[error("the ACME server did not answer in time")]
+    Timeout,
 }
 
 /// The tokens of the challenges that are waiting to be fetched, and what to answer.
@@ -204,6 +214,14 @@ struct Validity {
     /// When to obtain the next certificate: halfway through the validity period.
     renew_at: SystemTime,
     not_after: SystemTime,
+}
+
+/// Where a cached certificate came from. A certificate from another ACME server, such as
+/// a staging environment, or of another profile is not what was asked for.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct CertificateOrigin {
+    directory_url: String,
+    profile: Option<String>,
 }
 
 /// What is kept of the ACME account between restarts.
@@ -262,19 +280,31 @@ impl IpAcme {
     /// Makes sure a certificate is being served: the cached one if it is still good,
     /// otherwise a new one. Returns when the certificate has to be renewed.
     pub(super) async fn ensure_certificate(&self) -> Result<SystemTime, AcmeIpError> {
-        if let Some((chain, key)) = self.load_certificate()? {
+        let mut cached_is_valid = false;
+        if let Some((chain, key)) = self.load_certificate().await? {
             match self.install(&chain, &key) {
                 Ok(validity) if SystemTime::now() < validity.renew_at => {
                     info!(ip = %self.config.ip, "using the cached certificate");
                     return Ok(validity.renew_at);
                 }
-                // Past its renewal time. If it is still valid it stays in use until
-                // the new one is there.
-                Ok(_) => debug!("the cached certificate is due for renewal"),
+                // Past its renewal time, but still valid. It stays in use until the
+                // new one is there.
+                Ok(_) => {
+                    debug!("the cached certificate is due for renewal");
+                    cached_is_valid = true;
+                }
                 Err(err) => warn!("the cached certificate can not be used: {err:#}"),
             }
         }
-        Ok(self.obtain().await?.renew_at)
+        match self.obtain().await {
+            Ok(validity) => Ok(validity.renew_at),
+            // There is a certificate to serve. Start, and keep trying.
+            Err(err) if cached_is_valid => {
+                warn!(ip = %self.config.ip, "failed to renew the certificate: {err:#}");
+                Ok(SystemTime::now() + MIN_RETRY)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Renews the certificate whenever it is due. Does not return.
@@ -299,12 +329,18 @@ impl IpAcme {
         }
     }
 
-    /// Obtains a new certificate, stores it and starts serving it.
+    /// Obtains a new certificate, starts serving it and stores it.
     async fn obtain(&self) -> Result<Validity, AcmeIpError> {
         info!(ip = %self.config.ip, "obtaining a certificate");
-        let (chain, key) = self.issue().await?;
+        let (chain, key) = tokio::time::timeout(OBTAIN_TIMEOUT, self.issue())
+            .await
+            .map_err(|_| e!(AcmeIpError::Timeout))??;
         let validity = self.install(&chain, &key)?;
-        self.store_certificate(&chain, &key)?;
+        // The certificate is in use. Failing to store it only costs another order after
+        // a restart, it is no reason to order another one now.
+        if let Err(err) = self.store_certificate(chain, key).await {
+            warn!("failed to store the certificate: {err:#}");
+        }
         let valid_for = validity
             .not_after
             .duration_since(SystemTime::now())
@@ -372,7 +408,18 @@ impl IpAcme {
         if let Some(profile) = &self.config.profile {
             new_order = new_order.profile(profile);
         }
-        let mut order = account.new_order(&new_order).await.map_err(acme)?;
+        let mut order = match account.new_order(&new_order).await {
+            Ok(order) => order,
+            Err(err) => {
+                if account_is_gone(&err) {
+                    // The server no longer knows the account. Start over with a new
+                    // one on the next attempt.
+                    warn!("the ACME server rejected the account: {err:#}");
+                    self.forget_account().await;
+                }
+                return Err(acme(err));
+            }
+        };
 
         // Prove control of the address: the server fetches the token from port 80.
         let mut tokens = Vec::new();
@@ -436,13 +483,19 @@ impl IpAcme {
         if let Some(account) = current.as_ref() {
             return Ok(account.clone());
         }
-        if let Some(cached) = self.load_account()? {
+        if let Some(cached) = self.load_account().await? {
             match self.account_builder().from_credentials(cached).await {
                 Ok(account) => {
                     *current = Some(account.clone());
                     return Ok(account);
                 }
-                Err(err) => warn!("the cached ACME account can not be used: {err:#}"),
+                // The server says the account is no good. Create another one.
+                Err(err) if account_is_gone(&err) => {
+                    warn!("the cached ACME account can not be used: {err:#}");
+                }
+                // Anything else, such as the server not answering, says nothing about
+                // the account. Creating a new one would orphan it.
+                Err(err) => return Err(acme(err)),
             }
         }
         let contact: Vec<&str> = self.config.contact.iter().map(String::as_str).collect();
@@ -456,9 +509,25 @@ impl IpAcme {
             .create(&new_account, self.config.directory_url.clone(), None)
             .await
             .map_err(acme)?;
-        self.store_account(credentials)?;
+        if let Err(err) = self.store_account(credentials).await {
+            warn!("failed to store the ACME account: {err:#}");
+        }
         *current = Some(account.clone());
         Ok(account)
+    }
+
+    /// Forgets the ACME account, in memory and in the cache.
+    async fn forget_account(&self) {
+        *self.account.lock().await = None;
+        if let Some(path) = self.cache_file(ACCOUNT_FILE) {
+            let _ = blocking(move || match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                    Err(e!(AcmeIpError::Cache, err))
+                }
+                _ => Ok(()),
+            })
+            .await;
+        }
     }
 
     fn account_builder(&self) -> instant_acme::AccountBuilder {
@@ -477,20 +546,29 @@ impl IpAcme {
         self.config.cache_path.as_ref().map(|dir| dir.join(name))
     }
 
-    fn certificate_files(&self) -> Option<(PathBuf, PathBuf)> {
+    /// The files of the cached certificate: the chain, the key, and where it came from.
+    fn certificate_files(&self) -> Option<(PathBuf, PathBuf, PathBuf)> {
         // An IPv6 address has colons, which are not allowed in file names everywhere.
         let ip = self.config.ip.to_string().replace(':', "_");
         Some((
             self.cache_file(&format!("ip-{ip}.cert.pem"))?,
             self.cache_file(&format!("ip-{ip}.key.pem"))?,
+            self.cache_file(&format!("ip-{ip}.origin.json"))?,
         ))
     }
 
-    fn load_account(&self) -> Result<Option<AccountCredentials>, AcmeIpError> {
-        let Some(path) = self.cache_file("ip-acme-account.json") else {
+    fn origin(&self) -> CertificateOrigin {
+        CertificateOrigin {
+            directory_url: self.config.directory_url.clone(),
+            profile: self.config.profile.clone(),
+        }
+    }
+
+    async fn load_account(&self) -> Result<Option<AccountCredentials>, AcmeIpError> {
+        let Some(path) = self.cache_file(ACCOUNT_FILE) else {
             return Ok(None);
         };
-        let Some(json) = read_if_exists(&path)? else {
+        let Some(json) = blocking(move || read_if_exists(&path)).await? else {
             return Ok(None);
         };
         match serde_json::from_str::<CachedAccount>(&json) {
@@ -506,8 +584,8 @@ impl IpAcme {
         }
     }
 
-    fn store_account(&self, credentials: AccountCredentials) -> Result<(), AcmeIpError> {
-        let Some(path) = self.cache_file("ip-acme-account.json") else {
+    async fn store_account(&self, credentials: AccountCredentials) -> Result<(), AcmeIpError> {
+        let Some(path) = self.cache_file(ACCOUNT_FILE) else {
             return Ok(());
         };
         let cached = CachedAccount {
@@ -520,26 +598,79 @@ impl IpAcme {
                 io::Error::new(io::ErrorKind::InvalidData, err)
             )
         })?;
-        write_private(&path, &json)
+        blocking(move || write_private(&path, &json)).await
     }
 
-    fn load_certificate(&self) -> Result<Option<(String, String)>, AcmeIpError> {
-        let Some((cert, key)) = self.certificate_files() else {
+    /// Loads the cached certificate, if it is one from the configured ACME server and
+    /// of the configured profile.
+    async fn load_certificate(&self) -> Result<Option<(String, String)>, AcmeIpError> {
+        let Some((cert, key, origin)) = self.certificate_files() else {
             return Ok(None);
         };
-        match (read_if_exists(&cert)?, read_if_exists(&key)?) {
-            (Some(cert), Some(key)) => Ok(Some((cert, key))),
-            _ => Ok(None),
-        }
+        let expected = self.origin();
+        blocking(move || {
+            let (Some(cert), Some(key), Some(origin)) = (
+                read_if_exists(&cert)?,
+                read_if_exists(&key)?,
+                read_if_exists(&origin)?,
+            ) else {
+                return Ok(None);
+            };
+            match serde_json::from_str::<CertificateOrigin>(&origin) {
+                Ok(origin) if origin == expected => Ok(Some((cert, key))),
+                _ => {
+                    debug!("the cached certificate is from another ACME server or profile");
+                    Ok(None)
+                }
+            }
+        })
+        .await
     }
 
-    fn store_certificate(&self, chain: &str, key: &str) -> Result<(), AcmeIpError> {
-        let Some((cert_path, key_path)) = self.certificate_files() else {
+    async fn store_certificate(&self, chain: String, key: String) -> Result<(), AcmeIpError> {
+        let Some((cert_path, key_path, origin_path)) = self.certificate_files() else {
             return Ok(());
         };
-        // The key first: a certificate without its key is of no use.
-        write_private(&key_path, key)?;
-        write_private(&cert_path, chain)
+        let origin = serde_json::to_string(&self.origin()).map_err(|err| {
+            e!(
+                AcmeIpError::Cache,
+                io::Error::new(io::ErrorKind::InvalidData, err)
+            )
+        })?;
+        blocking(move || {
+            // The origin goes last. Without it the rest is not used, so a crash in
+            // between does not leave a certificate and a key that do not belong
+            // together in use.
+            let _ = std::fs::remove_file(&origin_path);
+            write_private(&key_path, &key)?;
+            write_private(&cert_path, &chain)?;
+            write_private(&origin_path, &origin)
+        })
+        .await
+    }
+}
+
+/// The name of the file the ACME account is cached in.
+const ACCOUNT_FILE: &str = "ip-acme-account.json";
+
+/// Returns whether `err` is the ACME server saying that it does not accept the account.
+fn account_is_gone(err: &instant_acme::Error) -> bool {
+    let instant_acme::Error::Api(problem) = err else {
+        return false;
+    };
+    problem
+        .r#type
+        .as_deref()
+        .is_some_and(|ty| ty.ends_with(":accountDoesNotExist") || ty.ends_with(":unauthorized"))
+}
+
+/// Runs file system work off the async runtime.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, AcmeIpError> + Send + 'static,
+) -> Result<T, AcmeIpError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(res) => res,
+        Err(err) => Err(e!(AcmeIpError::Cache, io::Error::other(err))),
     }
 }
 

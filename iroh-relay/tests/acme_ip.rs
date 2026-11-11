@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -41,6 +41,8 @@ struct Acme {
     validity: Duration,
     ca: rcgen::Issuer<'static, rcgen::KeyPair>,
     ca_cert: rcgen::Certificate,
+    /// Set to answer every request with an error, as if the server was down.
+    broken: AtomicBool,
     state: Mutex<AcmeState>,
 }
 
@@ -84,6 +86,7 @@ impl Acme {
             validity,
             ca,
             ca_cert,
+            broken: AtomicBool::new(false),
             state: Mutex::default(),
         });
         let weak = Arc::downgrade(&acme);
@@ -200,6 +203,12 @@ impl Acme {
     }
 
     async fn handle(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
+        if self.broken.load(Ordering::Relaxed) {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::default())
+                .unwrap();
+        }
         let path = req.uri().path().to_string();
         let method = req.method().clone();
         let body = req.into_body().collect().await.unwrap().to_bytes();
@@ -547,4 +556,61 @@ async fn fails_to_start_without_proof_of_control() {
     let err = spawn_relay(&acme, http_port, None).await.unwrap_err();
     assert!(matches!(err, SpawnError::AcmeIp { .. }), "{err:?}");
     assert_eq!(acme.orders(), 1);
+}
+
+#[tokio::test]
+async fn starts_with_the_cached_certificate_when_renewal_fails() {
+    let http_port = free_port();
+    let cache = TempDir::new();
+    // Valid for a few seconds, due for renewal halfway through.
+    let acme = Acme::spawn(http_port, Duration::from_secs(8)).await;
+    let server = spawn_relay(&acme, http_port, Some(&cache)).await.unwrap();
+    let serial = fetch(&acme, server.https_addr().unwrap()).await.unwrap();
+    server.shutdown().await.unwrap();
+
+    // The relay is restarted when the certificate is due for renewal but still valid,
+    // and the ACME server is down.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    acme.broken.store(true, Ordering::Relaxed);
+    let server = spawn_relay(&acme, http_port, Some(&cache)).await.unwrap();
+    assert_eq!(
+        fetch(&acme, server.https_addr().unwrap()).await.unwrap(),
+        serial
+    );
+    assert_eq!(acme.orders(), 1);
+    server.shutdown().await.unwrap();
+
+    // Without a certificate to fall back on the relay does not start.
+    let empty = TempDir::new();
+    let err = spawn_relay(&acme, http_port, Some(&empty))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SpawnError::AcmeIp { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn does_not_use_a_cached_certificate_of_another_acme_server() {
+    let http_port = free_port();
+    let cache = TempDir::new();
+    let validity = Duration::from_secs(6 * 24 * 3600);
+    // Think of the first as a staging environment, whose certificates nobody trusts.
+    let staging = Acme::spawn(http_port, validity).await;
+    let production = Acme::spawn(http_port, validity).await;
+
+    let server = spawn_relay(&staging, http_port, Some(&cache))
+        .await
+        .unwrap();
+    fetch(&staging, server.https_addr().unwrap()).await.unwrap();
+    server.shutdown().await.unwrap();
+
+    // The same cache, now with the other server. Neither the account nor the
+    // certificate of the first is used.
+    let server = spawn_relay(&production, http_port, Some(&cache))
+        .await
+        .unwrap();
+    let addr = server.https_addr().unwrap();
+    fetch(&production, addr).await.unwrap();
+    assert!(fetch(&staging, addr).await.is_err());
+    assert_eq!((production.accounts(), production.orders()), (1, 1));
+    assert_eq!((staging.accounts(), staging.orders()), (1, 1));
 }
