@@ -44,6 +44,7 @@ use crate::{
     tls::CaTlsConfig,
 };
 
+pub mod allocator;
 pub mod http_server;
 mod metrics;
 pub(crate) mod resolver;
@@ -52,6 +53,7 @@ pub mod streams;
 pub mod testing;
 
 pub use self::{
+    allocator::{ClientId, PortAllocator},
     http_server::{Handlers, RelayService},
     metrics::{Metrics, RelayMetrics},
     resolver::{DEFAULT_CERT_RELOAD_INTERVAL, reloading_resolver},
