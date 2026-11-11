@@ -21,9 +21,10 @@ provides:
 
 - `server`: the relay server and its binary.
 - `dht`: the mainline DHT service of the server.
-- `dns` (default): lets the client resolve host names with a DNS resolver of
-  its own. Without it the client uses the resolver of the operating system
-  and the crate has fewer dependencies.
+- `dns` (default): the client resolves host names with a DNS resolver of its
+  own, which looks up IPv4 and IPv6 addresses in parallel. Without it the
+  client uses the resolver of the operating system and the crate has fewer
+  dependencies.
 - `tls-ring` (default) and `tls-aws-lc-rs`: the cryptography provider.
 
 ## Build the server

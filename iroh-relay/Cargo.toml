@@ -97,7 +97,7 @@ cfg_aliases = "0.2.2"
 
 [features]
 default = ["metrics", "tls-ring", "dns"]
-# Lets the client resolve host names with a DNS resolver of its own instead of the
+# The client resolves host names with a DNS resolver of its own instead of the
 # operating system's.
 dns = ["dep:iroh-dns"]
 # Enables fetching TLS trust anchors from the operating system

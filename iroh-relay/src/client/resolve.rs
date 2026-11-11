@@ -29,24 +29,50 @@ pub enum ResolveError {
     Dns { source: iroh_dns::dns::DnsError },
 }
 
+/// How many lookups with the resolver of the operating system run at a time.
+///
+/// Such a lookup can not be cancelled. It blocks a thread until the operating system
+/// gives up, which can take much longer than the caller waits. Without a limit, a client
+/// that keeps reconnecting while the resolver is stuck would start a thread per attempt.
+const MAX_SYSTEM_LOOKUPS: usize = 4;
+
+static SYSTEM_LOOKUPS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_SYSTEM_LOOKUPS);
+
 /// How the client resolves the host name of a relay.
 ///
-/// By default this is the resolver of the operating system. With the `dns` feature a
-/// `DnsResolver` of the `iroh-dns` crate can be used instead, which resolves the address
-/// families in parallel and can be configured.
-#[derive(Debug, Clone, Default)]
+/// With the `dns` feature, which is on by default, this is a `DnsResolver` of the
+/// `iroh-dns` crate unless another resolver is chosen. It resolves the address families
+/// in parallel, so that one of them being slow does not hold up the other. Without the
+/// feature it is the resolver of the operating system.
+#[derive(Debug, Clone)]
 pub struct HostResolver(Inner);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 enum Inner {
-    #[default]
     System,
     #[cfg(feature = "dns")]
     Dns(DnsResolver),
 }
 
+impl Default for HostResolver {
+    fn default() -> Self {
+        #[cfg(feature = "dns")]
+        {
+            Self(Inner::Dns(DnsResolver::new()))
+        }
+        #[cfg(not(feature = "dns"))]
+        {
+            Self(Inner::System)
+        }
+    }
+}
+
 impl HostResolver {
     /// Resolves with the resolver of the operating system.
+    ///
+    /// It answers once it has the addresses of all families, and its lookups can not be
+    /// cancelled. Prefer a `DnsResolver` where the `dns` feature can be used.
     pub fn system() -> Self {
         Self(Inner::System)
     }
@@ -66,29 +92,27 @@ impl HostResolver {
         url: &Url,
         timeout: Duration,
     ) -> Pin<Box<dyn Stream<Item = Result<IpAddr, ResolveError>> + Send + 'a>> {
-        let domain = match url.host() {
-            None => return Box::pin(stream::once(Err(e!(ResolveError::MissingHost)))),
-            Some(url::Host::Ipv4(ip)) => return Box::pin(stream::once(Ok(IpAddr::V4(ip)))),
-            Some(url::Host::Ipv6(ip)) => return Box::pin(stream::once(Ok(IpAddr::V6(ip)))),
-            Some(url::Host::Domain(domain)) => domain.to_string(),
-        };
         match &self.0 {
             Inner::System => {
-                // The port does not matter for the lookup.
+                let host = url.host().map(|host| host.to_owned());
                 let lookup = async move {
-                    let addrs = time::timeout(timeout, tokio::net::lookup_host((domain, 0)))
-                        .await
-                        .map_err(|_| e!(ResolveError::Timeout))?
-                        .map_err(|err| e!(ResolveError::Lookup, err))?;
-                    let addrs: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
-                    if addrs.is_empty() {
-                        return Err(e!(ResolveError::NoAddresses));
+                    match host {
+                        None => Err(e!(ResolveError::MissingHost)),
+                        Some(url::Host::Ipv4(ip)) => Ok(vec![IpAddr::V4(ip)]),
+                        Some(url::Host::Ipv6(ip)) => Ok(vec![IpAddr::V6(ip)]),
+                        Some(url::Host::Domain(domain)) => {
+                            time::timeout(timeout, system_lookup(domain))
+                                .await
+                                .map_err(|_| e!(ResolveError::Timeout))?
+                        }
                     }
-                    Ok(addrs)
                 };
-                Box::pin(stream::once_future(lookup).flat_map(|res| match res {
-                    Ok(addrs) => stream::iter(addrs.into_iter().map(Ok).collect::<Vec<_>>()),
-                    Err(err) => stream::iter(vec![Err(err)]),
+                Box::pin(stream::once_future(lookup).flat_map(|res| {
+                    let results: Vec<Result<IpAddr, ResolveError>> = match res {
+                        Ok(addrs) => addrs.into_iter().map(Ok).collect(),
+                        Err(err) => vec![Err(err)],
+                    };
+                    stream::iter(results)
                 }))
             }
             #[cfg(feature = "dns")]
@@ -99,6 +123,31 @@ impl HostResolver {
             ),
         }
     }
+}
+
+/// Resolves `domain` with the resolver of the operating system.
+async fn system_lookup(domain: String) -> Result<Vec<IpAddr>, ResolveError> {
+    // Waiting here is covered by the caller's timeout. The slot goes with the lookup,
+    // which keeps it until the operating system answers, also when the caller has
+    // stopped waiting.
+    let slot = SYSTEM_LOOKUPS
+        .acquire()
+        .await
+        .expect("the semaphore is never closed");
+    let lookup = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        // The port does not matter for the lookup.
+        std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), 0))
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
+    });
+    let addrs = lookup
+        .await
+        .map_err(|err| e!(ResolveError::Lookup, std::io::Error::other(err)))?
+        .map_err(|err| e!(ResolveError::Lookup, err))?;
+    if addrs.is_empty() {
+        return Err(e!(ResolveError::NoAddresses));
+    }
+    Ok(addrs)
 }
 
 #[cfg(feature = "dns")]
@@ -142,9 +191,27 @@ mod tests {
             assert!(addr.unwrap().is_loopback());
         }
 
-        // A name that does not exist, see RFC 6761.
-        let addrs = resolve(&resolver, "https://does-not-exist.invalid/").await;
-        assert_eq!(addrs.len(), 1);
-        assert!(addrs[0].is_err());
+        let url = Url::parse("data:text/plain,no-host").unwrap();
+        let addrs: Vec<_> = resolver
+            .resolve_all(&url, Duration::from_secs(5))
+            .collect()
+            .await;
+        assert!(matches!(
+            addrs.as_slice(),
+            [Err(ResolveError::MissingHost { .. })]
+        ));
+    }
+
+    #[cfg(feature = "dns")]
+    #[tokio::test]
+    async fn default_is_the_dns_resolver() {
+        assert!(matches!(HostResolver::default().0, Inner::Dns(_)));
+        assert!(matches!(HostResolver::system().0, Inner::System));
+    }
+
+    #[cfg(not(feature = "dns"))]
+    #[test]
+    fn default_is_the_system_resolver() {
+        assert!(matches!(HostResolver::default().0, Inner::System));
     }
 }

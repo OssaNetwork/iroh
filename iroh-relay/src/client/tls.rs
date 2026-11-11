@@ -382,6 +382,43 @@ fn with_password_masked(url: &Url) -> Url {
     url
 }
 
+#[cfg(test)]
+mod system_resolver_tests {
+    use std::net::Ipv4Addr;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Dials through the resolver of the operating system, which is what the client
+    /// uses without the `dns` feature.
+    #[tokio::test]
+    async fn dials_a_host_name() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resolver = HostResolver::system();
+
+        // The name resolves to both families on most machines. Only one of them is
+        // listening, the other one is refused.
+        let url: Url = format!("http://localhost:{port}").parse().unwrap();
+        for prefer_ipv6 in [false, true] {
+            let stream = dial_happy_eyeballs(&resolver, &url, prefer_ipv6)
+                .await
+                .unwrap();
+            assert_eq!(stream.peer_addr().unwrap().port(), port);
+            listener.accept().await.unwrap();
+        }
+
+        // An address needs no lookup.
+        let url: Url = format!("http://127.0.0.1:{port}").parse().unwrap();
+        dial_happy_eyeballs(&resolver, &url, false).await.unwrap();
+
+        // Nothing listens here.
+        drop(listener);
+        assert!(dial_happy_eyeballs(&resolver, &url, false).await.is_err());
+    }
+}
+
 // The tests resolve to addresses of their choosing, which takes a DNS resolver.
 #[cfg(all(test, feature = "dns"))]
 mod tests {

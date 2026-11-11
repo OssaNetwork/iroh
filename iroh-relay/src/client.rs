@@ -37,6 +37,10 @@ mod tls;
 mod tunnel;
 mod util;
 
+/// The DNS resolver that a [`HostResolver`] can be made of.
+#[cfg(feature = "dns")]
+pub use iroh_dns::dns::DnsResolver;
+
 pub use self::{
     addr::{PathAddr, RelayIndex},
     link::{
@@ -170,7 +174,7 @@ impl WsDialer {
 
     /// Sets how the host names of the relay and of the proxy are resolved.
     ///
-    /// Defaults to the resolver of the operating system.
+    /// See [`HostResolver`] for the default.
     pub fn resolver(mut self, resolver: impl Into<HostResolver>) -> Self {
         self.resolver = resolver.into();
         self
