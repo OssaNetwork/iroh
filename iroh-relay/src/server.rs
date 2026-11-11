@@ -582,7 +582,7 @@ impl Server {
         &self.metrics
     }
 
-    /// Returns a handle to the embedded [`RelayService`] for runtime control.
+    /// Returns the embedded [`RelayService`] that serves the relay's HTTP endpoints.
     pub fn relay_service(&self) -> Option<&RelayService> {
         self.relay_service.as_ref()
     }

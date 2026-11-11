@@ -76,7 +76,12 @@ fn load_secret_key(
 /// Configuration for the relay-server.
 ///
 /// This is (de)serialised to/from a TOML config file.
+///
+/// Unknown fields are rejected. The `access`, `limits` and `key_cache_capacity` fields
+/// of iroh's relay no longer exist, and silently ignoring them would start a server
+/// without the restrictions its config asks for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     /// Whether to enable the Relay server.
     ///
@@ -186,6 +191,7 @@ mod cfg_defaults {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TlsConfig {
     /// The socket address to bind the Relay HTTPS server on.
     ///
@@ -510,6 +516,22 @@ mod tests {
     use n0_error::Result;
 
     use super::*;
+
+    #[test]
+    fn test_removed_fields_are_rejected() {
+        for config in [
+            "access = \"everyone\"",
+            "access.allowlist = []",
+            "access.shared_token = [\"token\"]",
+            "key_cache_capacity = 1024",
+            "[limits.client.rx]\nbytes_per_second = 400",
+        ] {
+            assert!(
+                Config::from_str(config).is_err(),
+                "config must be rejected: {config}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_enable_relay_config() -> Result {

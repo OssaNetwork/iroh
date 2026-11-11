@@ -40,6 +40,10 @@ pub enum ConnectError {
     InvalidWebsocketUrl { url: Url },
     #[error("Invalid relay URL: {url}")]
     InvalidRelayUrl { url: Url },
+    #[error("Invalid path, it must be relative to the relay URL: {path}")]
+    InvalidPath { path: String },
+    #[error("Invalid websocket subprotocol: {subprotocol}")]
+    InvalidSubprotocol { subprotocol: String },
     /// Error returned from the underlying WebSocket stream while establishing the connection.
     ///
     /// The concrete error type is `tokio_websockets::Error`. Use [`AnyError::downcast_ref`]
@@ -195,14 +199,20 @@ impl WsDialer {
     ///
     /// The relay URL is given with the `http` or `https` scheme; the matching `ws` or
     /// `wss` scheme is used for the connection. The server must confirm `subprotocol`.
+    ///
+    /// `path` is joined onto the relay URL, so a relay served under a path prefix keeps
+    /// it: `https://example.com/prefix/` and `control` give
+    /// `https://example.com/prefix/control`. A `path` that would leave the relay URL, such
+    /// as an absolute path or a full URL, is rejected.
     pub async fn connect(
         &self,
         path: &str,
-        subprotocol: &'static str,
+        subprotocol: &str,
     ) -> Result<WsConnection, ConnectError> {
-        let mut dial_url = self.url.join(path).map_err(|_| {
-            e!(ConnectError::InvalidRelayUrl {
-                url: self.url.clone()
+        let mut dial_url = join_relative(&self.url, path)?;
+        let subprotocol_header = http::HeaderValue::from_str(subprotocol).map_err(|_| {
+            e!(ConnectError::InvalidSubprotocol {
+                subprotocol: subprotocol.to_string()
             })
         })?;
         dial_url
@@ -245,10 +255,7 @@ impl WsDialer {
                     url: dial_url.clone()
                 })
             })?
-            .add_header(
-                SEC_WEBSOCKET_PROTOCOL,
-                http::HeaderValue::from_static(subprotocol),
-            )
+            .add_header(SEC_WEBSOCKET_PROTOCOL, subprotocol_header)
             .expect("valid header name and value")
             .limits(tokio_websockets::Limits::default().max_payload_len(Some(self.max_payload_len)))
             // Automatic flushing after a threshold is turned off (the default would be
@@ -294,6 +301,31 @@ impl WsDialer {
             None => false,
         }
     }
+}
+
+/// Joins `path` onto `base`, rejecting paths that do not stay below `base`.
+fn join_relative(base: &Url, path: &str) -> Result<Url, ConnectError> {
+    let invalid = || {
+        e!(ConnectError::InvalidPath {
+            path: path.to_string()
+        })
+    };
+    let joined = base.join(path).map_err(|_| invalid())?;
+    // The directory of the base URL: everything up to and including the last slash.
+    let base_dir = match base.path().rfind('/') {
+        Some(idx) => &base.path()[..=idx],
+        None => "/",
+    };
+    let same_origin = joined.scheme() == base.scheme()
+        && joined.host() == base.host()
+        && joined.port_or_known_default() == base.port_or_known_default();
+    n0_error::ensure!(
+        same_origin && joined.path().starts_with(base_dir),
+        ConnectError::InvalidPath {
+            path: path.to_string()
+        }
+    );
+    Ok(joined)
 }
 
 /// An established WebSocket connection to a relay server.
@@ -358,5 +390,45 @@ impl Sink<Bytes> for WsConnection {
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.io).poll_close(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_relative_keeps_the_relay_url() {
+        let join = |base: &str, path: &str| {
+            join_relative(&Url::parse(base).unwrap(), path).map(|url| url.to_string())
+        };
+        assert_eq!(
+            join("https://example.com", "control").unwrap(),
+            "https://example.com/control"
+        );
+        assert_eq!(
+            join("https://example.com/prefix/", "tunnel/443").unwrap(),
+            "https://example.com/prefix/tunnel/443"
+        );
+        assert_eq!(
+            join("https://198.51.100.7:8443/", "tunnel/443").unwrap(),
+            "https://198.51.100.7:8443/tunnel/443"
+        );
+
+        for path in [
+            "/control",
+            "//other.example/control",
+            "https://other.example/control",
+            "http://example.com/prefix/control",
+            "../control",
+        ] {
+            assert!(
+                matches!(
+                    join("https://example.com/prefix/", path),
+                    Err(ConnectError::InvalidPath { .. })
+                ),
+                "path must be rejected: {path}"
+            );
+        }
     }
 }

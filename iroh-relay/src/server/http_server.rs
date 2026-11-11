@@ -432,11 +432,8 @@ impl Inner {
     fn not_found_fn(
         &self,
         _req: Request<Incoming>,
-        mut res: ResponseBuilder,
+        res: ResponseBuilder,
     ) -> HyperResult<Response<BytesBody>> {
-        for (k, v) in self.headers.iter() {
-            res = res.header(k.clone(), v.clone());
-        }
         let body = body_full("Not Found");
         let r = res.status(StatusCode::NOT_FOUND).body(body)?;
         HyperResult::Ok(r)
