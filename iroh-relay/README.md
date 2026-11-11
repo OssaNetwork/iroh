@@ -1,27 +1,16 @@
 # Iroh Relay
 
-Iroh's relay is a feature within [iroh], a peer-to-peer networking system
-designed to facilitate direct, encrypted connections between devices. Iroh aims
-to simplify decentralized communication by automatically handling connections
-through "relays" when direct connections aren't immediately possible. The relay
-server helps establish connections by temporarily routing encrypted traffic
-until a direct, P2P connection is feasible. Once this direct path is set up,
-the relay server steps back, and the data flows directly between devices. This
-approach allows Iroh to maintain a secure, low-latency connection, even in
-challenging network situations.
+This is a fork of [iroh]'s relay that is being reworked into a transparent QUIC
+relay. A client that cannot accept inbound connections is given a public UDP
+port on the relay and advertises the relay's IP and that port as its own
+address. The relay forwards QUIC packets without being able to read them.
 
-This crate provides a complete setup for creating and interacting with iroh
-relays, including:
-- Relay Protocol: The protocol used to communicate between relay servers and
-  clients
-- Relay Server: A fully-fledged iroh-relay server over HTTP or HTTPS.
-  Optionally will also expose a QAD endpoint and metrics.
-- Relay Client: A client for establishing connections to the relay.
-- Server Binary: A CLI for running your own relay server. It can be configured
-  to also expose metrics.
-
-
-Used in [iroh], created with love by the [n0 team](https://n0.computer/).
+iroh's own relay protocol has been removed from this crate. It currently
+provides:
+- Relay Server: an HTTP or HTTPS server with latency probe and captive portal
+  endpoints. Optionally will also expose a QAD endpoint and metrics.
+- Relay Client: a WebSocket dialer for connecting to the relay.
+- Server Binary: A CLI for running your own relay server.
 
 ## Build the server
 
@@ -37,89 +26,6 @@ cargo build \
 ```
 
 You will find the optimised binary at `target/optimized-release/iroh-relay`.
-
-## Access control
-
-The relay server supports several access control modes, configured via the
-`access` field in the TOML config file.
-
-### Allow everyone (default)
-
-```toml
-access = "everyone"
-```
-
-### Allowlist / Denylist by endpoint ID
-
-```toml
-# Allow only specific endpoints
-access.allowlist = ["<endpoint-id>", "<endpoint-id>"]
-
-# Or block specific endpoints and allow everyone else
-access.denylist = ["<endpoint-id>"]
-```
-
-### Shared token (local, no external service)
-
-Requires connecting clients to present one of the configured shared secrets via an
-`Authorization: Bearer <token>` header, or a `?token=` URL query parameter.
-
-```toml
-access.shared_token = ["token-a", "token-b"]
-```
-
-The token list can also be overridden by the `IROH_RELAY_ACCESS_TOKEN` environment
-variable, which sets a single allowed token and takes precedence over the config file
-value. A single value is used (rather than a comma-separated list) to avoid restricting
-the character set of tokens.
-
-The token list must not be empty, and no token may be an empty string; the server will
-fail to start if either condition is violated.
-
-On the client side, set the token using
-[`RelayConfig::with_auth_token`](https://docs.rs/iroh-relay/latest/iroh_relay/struct.RelayConfig.html#method.with_auth_token)
-or
-[`RelayMap::with_auth_token`](https://docs.rs/iroh-relay/latest/iroh_relay/struct.RelayMap.html#method.with_auth_token).
-
-> **Note:** this shared token does not support revocation other than updating the config and restarting the service.
-
-### HTTP callout (external auth service)
-
-The relay calls an external HTTP endpoint for each incoming connection,
-passing the connecting endpoint's ID. The token below authenticates the relay
-to your auth service (machine-to-machine), not the connecting client.
-
-```toml
-access.http.url = "https://your-auth-service.example.com/relay-auth"
-# Optional: authenticate the relay's outbound request to your service
-access.http.bearer_token = "service-to-service-secret"
-```
-
-The bearer token can also be set via the `IROH_RELAY_HTTP_BEARER_TOKEN`
-environment variable.
-
-For every connection, the relay sends a `POST` request with no body to
-`access.http.url`. The connecting endpoint's ID is sent in the
-`X-Iroh-Endpoint-Id` header. If a bearer token is configured, it is sent in an
-`Authorization: Bearer <token>` header.
-
-To allow the connection, your service must respond with status `200` and the
-response body `true`.
-
-Example request:
-
-```http
-POST /relay-auth HTTP/1.1
-x-iroh-endpoint-id: da1ee49ba54d124a2e2b0f043bac3d63ec086b0b40e7d0895914898b237e847e
-x-iroh-nodeid: da1ee49ba54d124a2e2b0f043bac3d63ec086b0b40e7d0895914898b237e847e
-authorization: Bearer service-to-service-secret
-accept: */*
-host: your-auth-service.example.com
-```
-
-> **Note:** the endpoint ID is also sent in the deprecated `X-Iroh-NodeId`
-> header for backwards compatibility. It will be removed in a future release.
->New services should use `X-Iroh-Endpoint-Id`.
 
 ## Local testing
 

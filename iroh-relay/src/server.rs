@@ -11,35 +11,18 @@
 //!
 //! The relay server hosts the following services:
 //!
-//! - HTTPS `/relay`: The main URL endpoint to which clients connect and sends traffic over.
 //! - HTTPS `/ping`: Used for net_report probes.
 //! - HTTPS `/generate_204`: Used for net_report probes.
 
-use std::{
-    borrow::Cow,
-    future::Future,
-    net::SocketAddr,
-    num::NonZeroU32,
-    path::PathBuf,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use derive_more::Debug;
 use http::{
-    HeaderMap, HeaderValue, Method, Request, Response, StatusCode,
-    header::{AUTHORIZATION, InvalidHeaderValue},
+    HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header::InvalidHeaderValue,
     response::Builder as ResponseBuilder,
 };
 use http_body_util::Full;
 use hyper::body::Incoming;
-use iroh_base::EndpointId;
-#[cfg(feature = "test-utils")]
-use iroh_base::RelayUrl;
 use n0_error::{e, stack_error};
 use n0_future::{StreamExt, task::AbortOnDropHandle};
 use rustls::server::WantsServerCert;
@@ -56,14 +39,11 @@ use tracing::{Instrument, debug, error, info, info_span, instrument};
 
 use self::http_server::{BytesBody, HyperError, HyperResult};
 use crate::{
-    defaults::DEFAULT_KEY_CACHE_CAPACITY,
-    http::{AUTH_TOKEN_URL_QUERY_PARAM, ProtocolVersion, RELAY_PROBE_RELATIVE_PATH},
+    http::RELAY_PROBE_RELATIVE_PATH,
     quic::server::{QuicServer, QuicSpawnError, ServerHandle as QuicServerHandle},
     tls::CaTlsConfig,
 };
 
-pub mod client;
-pub mod clients;
 pub mod http_server;
 mod metrics;
 pub(crate) mod resolver;
@@ -121,8 +101,7 @@ pub struct ServerConfig {
 
 /// Configuration for the Relay HTTP and HTTPS server.
 ///
-/// This includes the HTTP services hosted by the Relay server, the Relay `/relay` HTTP
-/// endpoint is only one of the services served.
+/// This includes the HTTP services hosted by the Relay server.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct RelayConfig {
@@ -139,288 +118,16 @@ pub struct RelayConfig {
     /// If *None* all the HTTP services that would be served here are served from
     /// [`RelayConfig::http_bind_addr`].
     pub tls: Option<TlsConfig>,
-    /// Rate limits.
-    pub limits: Limits,
-    /// Key cache capacity.
-    pub key_cache_capacity: Option<usize>,
-    /// Access control for incoming connections.
-    pub access: Arc<dyn DynAccessControl>,
 }
 
 impl RelayConfig {
     /// Creates a new [`RelayConfig`] bound to `http_bind_addr` with default settings.
     ///
-    /// TLS is disabled, default [`Limits`] are used, the key cache capacity is unset, and
-    /// access defaults to [`AllowAll`]. Adjust any of these by assigning to the
-    /// corresponding fields after construction.
+    /// TLS is disabled. Enable it by assigning to [`RelayConfig::tls`] after construction.
     pub fn new(http_bind_addr: impl Into<SocketAddr>) -> Self {
         Self {
             http_bind_addr: http_bind_addr.into(),
             tls: None,
-            limits: Limits::default(),
-            key_cache_capacity: None,
-            access: Arc::new(AllowAll),
-        }
-    }
-}
-
-/// A process-unique identifier for a single relay client connection.
-///
-/// A new id is assigned to every incoming connection when its [`ClientRequest`]
-/// is created, before the access check runs. The same id is passed to
-/// [`AccessControl::on_connect`] and [`AccessControl::on_disconnect`], so an
-/// implementation can match the two callbacks even when one endpoint holds
-/// several concurrent connections.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, derive_more::Display)]
-#[display("{_0}")]
-pub struct ConnectionId(u64);
-
-impl ConnectionId {
-    /// Returns a fresh, process-unique connection id.
-    fn next() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self(NEXT.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-/// Details about an incoming relay client connection.
-///
-/// Passed to [`AccessControl::on_connect`] to decide whether to admit the connection.
-#[derive(Debug, Clone)]
-pub struct ClientRequest {
-    connection_id: ConnectionId,
-    endpoint_id: EndpointId,
-    protocol_version: ProtocolVersion,
-    request: http::request::Parts,
-}
-
-impl ClientRequest {
-    /// Creates a new [`ClientRequest`] from an [`EndpointId`] and HTTP request parts.
-    ///
-    /// The [`EndpointId`] must be proven by the relay handshake. The request parts
-    /// come from the client's WebSocket request. A fresh [`ConnectionId`] is assigned.
-    pub fn new(
-        endpoint_id: EndpointId,
-        protocol_version: ProtocolVersion,
-        request: http::request::Parts,
-    ) -> Self {
-        Self {
-            connection_id: ConnectionId::next(),
-            endpoint_id,
-            protocol_version,
-            request,
-        }
-    }
-
-    /// Returns the [`ConnectionId`] assigned to this connection.
-    pub fn connection_id(&self) -> ConnectionId {
-        self.connection_id
-    }
-
-    /// Returns the [`ProtocolVersion`] negotiated for this connection.
-    pub fn protocol_version(&self) -> ProtocolVersion {
-        self.protocol_version
-    }
-
-    /// Returns the [`EndpointId`] of the client.
-    ///
-    /// The relay handshake authenticates this id before the access hook
-    /// is invoked. The client proves possession of the secret key for
-    /// this public key by either signing keying material exported from
-    /// the TLS session or a challenge issued by the server.
-    pub fn endpoint_id(&self) -> EndpointId {
-        self.endpoint_id
-    }
-
-    /// Returns the URI of the HTTP request with which the client connected.
-    pub fn uri(&self) -> &http::Uri {
-        &self.request.uri
-    }
-
-    /// Returns an iterator over the query parameters set in the URI of the HTTP request.
-    ///
-    /// Each item is a `(name, value)` pair. Both names and values are percent-decoded.
-    /// The query string is parsed in order, and the same name may appear more than once.
-    pub fn query_pairs(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
-        url::form_urlencoded::parse(self.request.uri.query().unwrap_or("").as_bytes())
-    }
-
-    /// Returns the headers of the HTTP request with which the client connected.
-    pub fn headers(&self) -> &http::HeaderMap {
-        &self.request.headers
-    }
-
-    /// Returns the authorization token from the client's HTTP request, if any.
-    ///
-    /// Walks the `Authorization` headers in order and returns the value of
-    /// the first one whose scheme is `Bearer` (matched case-insensitively).
-    /// Headers with a different scheme are skipped.
-    ///
-    /// If none of the `Authorization` headers carries a `Bearer` scheme,
-    /// returns the value of the `token` URL query parameter, or `None` if
-    /// the URL has no `token` parameter.
-    ///
-    /// If an `Authorization` header value is not valid UTF-8 the function returns
-    /// `None` immediately, without checking later headers or the URL query.
-    pub fn auth_token(&self) -> Option<String> {
-        for value in self.request.headers.get_all(AUTHORIZATION) {
-            let value = value.to_str().ok()?;
-            if let Some((scheme, token)) = value.split_once(' ')
-                && scheme.eq_ignore_ascii_case("Bearer")
-            {
-                return Some(token.to_string());
-            }
-        }
-        self.query_pairs()
-            .find(|(name, _)| name == AUTH_TOKEN_URL_QUERY_PARAM)
-            .map(|(_, value)| value.into_owned())
-    }
-}
-
-/// Controls which endpoints may use the relay and observes their lifecycle.
-///
-/// Implement this trait to gate access to a relay server.
-///
-/// Both callbacks carry the connection's [`ConnectionId`], so an implementation
-/// can index connections precisely even when one endpoint holds several.
-pub trait AccessControl: std::fmt::Debug + Send + Sync + 'static {
-    /// Decides whether a connecting client is admitted.
-    ///
-    /// Called once per incoming connection, before the connection is
-    /// registered. Returns [`Access::Allow`] to admit it or [`Access::Deny`]
-    /// to reject it.
-    ///
-    /// Can be implemented as `async fn on_connect(&self, request: &ClientRequest) -> Access`.
-    fn on_connect(&self, request: &ClientRequest) -> impl Future<Output = Access> + Send;
-
-    /// Notifies that a connection has ended.
-    ///
-    /// Called once for every connection that [`Self::on_connect`] admitted,
-    /// identified by the same [`ConnectionId`].
-    ///
-    /// Note that this is a sync method being called in an async context. Make sure that your
-    /// implementation does not block the runtime.
-    fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
-        let _ = (endpoint_id, connection_id);
-    }
-}
-
-/// A dyn-compatible version of [`AccessControl`] that returns boxed futures.
-///
-/// Any type that implements [`AccessControl`] automatically implements
-/// `DynAccessControl`. Wrap it in an `Arc` to store it as an
-/// `Arc<dyn DynAccessControl>`, for example in [`RelayConfig::access`].
-pub trait DynAccessControl: std::fmt::Debug + Send + Sync + 'static {
-    /// See [`AccessControl::on_connect`].
-    fn on_connect<'a>(
-        &'a self,
-        request: &'a ClientRequest,
-    ) -> Pin<Box<dyn Future<Output = Access> + Send + 'a>>;
-
-    /// See [`AccessControl::on_disconnect`].
-    fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId);
-}
-
-impl<T: AccessControl> DynAccessControl for T {
-    fn on_connect<'a>(
-        &'a self,
-        request: &'a ClientRequest,
-    ) -> Pin<Box<dyn Future<Output = Access> + Send + 'a>> {
-        Box::pin(<Self as AccessControl>::on_connect(self, request))
-    }
-
-    fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
-        <Self as AccessControl>::on_disconnect(self, endpoint_id, connection_id)
-    }
-}
-
-/// An [`AccessControl`] that admits every endpoint.
-///
-/// This is the default used by [`RelayConfig::new`].
-#[derive(Debug, Clone, Copy)]
-pub struct AllowAll;
-
-impl AccessControl for AllowAll {
-    async fn on_connect(&self, _request: &ClientRequest) -> Access {
-        Access::Allow
-    }
-}
-
-/// Access restriction for an endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Access {
-    /// Access is allowed.
-    Allow,
-    /// Access is denied.
-    Deny {
-        /// Optional reason for denial to send back to the client.
-        reason: Option<String>,
-    },
-}
-
-/// Reports a connection's disconnect to [`AccessControl`] when dropped.
-///
-/// A guard is created the moment [`AccessControl::on_connect`] admits a
-/// connection, and is then held for the connection's entire lifetime. Dropping
-/// it - whether the connection closed cleanly, hit an error, or setup returned
-/// early - calls [`AccessControl::on_disconnect`] exactly once.
-///
-/// Threading the guard through connection setup and into the connection actor
-/// makes it impossible to admit a connection without eventually reporting its
-/// disconnect, even as the surrounding code changes.
-///
-/// Embedders that register connections through [`Clients::register`] construct
-/// the guard themselves; see that method for the expected lifecycle.
-///
-/// [`Clients::register`]: crate::server::clients::Clients::register
-#[derive(Debug)]
-pub struct OnDisconnectGuard {
-    access: Option<Arc<dyn DynAccessControl>>,
-    endpoint_id: EndpointId,
-    connection_id: ConnectionId,
-}
-
-impl OnDisconnectGuard {
-    /// Creates a guard for the connection described by `request`.
-    ///
-    /// Dropping the guard calls [`AccessControl::on_disconnect`] on `access`
-    /// with the request's [`EndpointId`] and [`ConnectionId`]. Create it only
-    /// once [`AccessControl::on_connect`] has admitted the connection.
-    pub fn for_access_control(access: Arc<dyn DynAccessControl>, request: &ClientRequest) -> Self {
-        Self {
-            access: Some(access),
-            endpoint_id: request.endpoint_id(),
-            connection_id: request.connection_id(),
-        }
-    }
-
-    /// Creates a no-op guard for `endpoint_id`.
-    ///
-    /// The guard carries `endpoint_id` and a fresh [`ConnectionId`] but has no
-    /// access control attached, so dropping it does nothing.
-    pub fn empty(endpoint_id: EndpointId) -> Self {
-        Self {
-            access: None,
-            endpoint_id,
-            connection_id: ConnectionId::next(),
-        }
-    }
-
-    /// Returns the [`EndpointId`] of the guarded connection.
-    pub fn endpoint_id(&self) -> EndpointId {
-        self.endpoint_id
-    }
-
-    /// Returns the [`ConnectionId`] of the guarded connection.
-    pub fn connection_id(&self) -> ConnectionId {
-        self.connection_id
-    }
-}
-
-impl Drop for OnDisconnectGuard {
-    fn drop(&mut self) {
-        if let Some(access) = self.access.as_ref() {
-            access.on_disconnect(self.endpoint_id, self.connection_id);
         }
     }
 }
@@ -479,45 +186,6 @@ impl TlsConfig {
         Self {
             https_bind_addr: https_bind_addr.into(),
             cert,
-        }
-    }
-}
-
-/// Rate limits.
-// TODO: accept_conn_limit and accept_conn_burst are not currently implemented.
-#[derive(Debug, Default)]
-#[non_exhaustive]
-pub struct Limits {
-    /// Rate limits for incoming traffic from a client connection.
-    pub client_rx: Option<ClientRateLimit>,
-    /// Rate limit for accepting new connections. Unlimited if not set.
-    ///
-    /// Not currently implemented, setting this has no effect.
-    pub accept_conn_limit: Option<f64>,
-    /// Burst limit for accepting new connections. Unlimited if not set.
-    ///
-    /// Not currently implemented, setting this has no effect.
-    pub accept_conn_burst: Option<usize>,
-}
-
-/// Per-client rate limit configuration.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ClientRateLimit {
-    /// Max number of bytes per second to read from the client connection.
-    pub bytes_per_second: NonZeroU32,
-    /// Max number of bytes to read in a single burst.
-    pub max_burst_bytes: Option<NonZeroU32>,
-}
-
-impl ClientRateLimit {
-    /// Creates a new [`ClientRateLimit`] with the given byte rate.
-    ///
-    /// `max_burst_bytes` is left unset; assign it after construction to allow bursting.
-    pub fn new(bytes_per_second: NonZeroU32) -> Self {
-        Self {
-            bytes_per_second,
-            max_burst_bytes: None,
         }
     }
 }
@@ -726,22 +394,14 @@ impl Server {
                     Some(ref tls) => tls.https_bind_addr,
                     None => relay_config.http_bind_addr,
                 };
-                let key_cache_capacity = relay_config
-                    .key_cache_capacity
-                    .unwrap_or(DEFAULT_KEY_CACHE_CAPACITY);
                 let mut builder = http_server::ServerBuilder::new(relay_bind_addr)
                     .metrics(metrics.server.clone())
                     .headers(headers)
-                    .key_cache_capacity(key_cache_capacity)
-                    .access(relay_config.access)
                     .request_handler(Method::GET, "/", Box::new(root_handler))
                     .request_handler(Method::GET, "/index.html", Box::new(root_handler))
                     .request_handler(Method::GET, probe_route(), Box::new(probe_handler))
                     .request_handler(Method::GET, "/robots.txt", Box::new(robots_handler))
                     .request_handler(Method::GET, "/healthz", Box::new(healthz_handler));
-                if let Some(cfg) = relay_config.limits.client_rx {
-                    builder = builder.client_rx_ratelimit(cfg);
-                }
                 let (http_addr, tls_config) = match relay_config.tls {
                     Some(tls_config) => {
                         let server_tls_config = match tls_config.cert {
@@ -915,30 +575,6 @@ impl Server {
     /// The socket address the QUIC server is listening on.
     pub fn quic_addr(&self) -> Option<SocketAddr> {
         self.quic_addr
-    }
-
-    /// Get the server's https [`RelayUrl`].
-    ///
-    /// This uses [`Self::https_addr`] so it's mostly useful for local development.
-    #[cfg(feature = "test-utils")]
-    pub fn https_url(&self) -> Option<RelayUrl> {
-        self.https_addr.map(|addr| {
-            url::Url::parse(&format!("https://{addr}"))
-                .expect("valid url")
-                .into()
-        })
-    }
-
-    /// Get the server's http [`RelayUrl`].
-    ///
-    /// This uses [`Self::http_addr`] so it's mostly useful for local development.
-    #[cfg(feature = "test-utils")]
-    pub fn http_url(&self) -> Option<RelayUrl> {
-        self.http_addr.map(|addr| {
-            url::Url::parse(&format!("http://{addr}"))
-                .expect("valid url")
-                .into()
-        })
     }
 
     /// Returns the metrics collected in the relay server.
@@ -1203,77 +839,21 @@ mod tests {
     use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
     use http::StatusCode;
-    use iroh_base::{EndpointId, RelayUrl, SecretKey};
-    use iroh_dns::dns::DnsResolver;
-    use n0_error::{Result, StackResultExt, StdResultExt};
-    use n0_future::{SinkExt, StreamExt};
     use n0_tracing_test::traced_test;
-    use rand::{RngExt, SeedableRng};
-    use tracing::{info, instrument};
-    use url::Url;
 
     use super::{
-        Access, AccessControl, ClientRequest, NO_CONTENT_CHALLENGE_HEADER,
-        NO_CONTENT_RESPONSE_HEADER, RelayConfig, Server, ServerConfig, SpawnError,
+        NO_CONTENT_CHALLENGE_HEADER, NO_CONTENT_RESPONSE_HEADER, RelayConfig, Server, ServerConfig,
+        SpawnError,
     };
-    use crate::{
-        client::{ClientBuilder, ConnectError},
-        protos::{
-            handshake,
-            relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg},
-        },
-        test_utils::static_resolver,
-        tls::{self, CaTlsConfig, default_provider},
-    };
-
-    /// An [`AccessControl`] backed by a closure, for tests.
-    #[derive(derive_more::Debug)]
-    struct TestAccess(#[debug("access fn")] Box<dyn Fn(&ClientRequest) -> Access + Send + Sync>);
-
-    impl AccessControl for TestAccess {
-        async fn on_connect(&self, request: &ClientRequest) -> Access {
-            (self.0)(request)
-        }
-    }
 
     async fn spawn_local_relay() -> std::result::Result<Server, SpawnError> {
-        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-        relay.key_cache_capacity = Some(1024);
+        let relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
         Server::spawn(ServerConfig {
             relay: Some(relay),
             quic: None,
             metrics_addr: None,
         })
         .await
-    }
-
-    #[instrument]
-    async fn try_send_recv(
-        client_a: &mut crate::client::Client,
-        client_b: &mut crate::client::Client,
-        b_key: EndpointId,
-        msg: Datagrams,
-    ) -> Result<RelayToClientMsg> {
-        // try resend 10 times
-        for _ in 0..10 {
-            client_a
-                .send(ClientToRelayMsg::Datagrams {
-                    dst_endpoint_id: b_key,
-                    datagrams: msg.clone(),
-                })
-                .await?;
-            let Ok(res) = tokio::time::timeout(Duration::from_millis(500), client_b.next()).await
-            else {
-                continue;
-            };
-            let res = res.expect("stream finished")?;
-            return Ok(res);
-        }
-        panic!("failed to send and recv message");
-    }
-
-    fn dns_resolver() -> DnsResolver {
-        DnsResolver::new()
     }
 
     fn ring_config() -> rustls::ClientConfig {
@@ -1300,8 +880,7 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn test_conflicting_bind() {
-        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 1234));
-        relay.key_cache_capacity = Some(1024);
+        let relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 1234));
         let res = Server::spawn(ServerConfig {
             relay: Some(relay),
             quic: None,
@@ -1349,306 +928,5 @@ mod tests {
         assert_eq!(header.to_str().unwrap(), format!("response {challenge}"));
         let body = response.text().await.unwrap();
         assert!(body.is_empty());
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_relay_clients() -> Result<()> {
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
-        let server = spawn_local_relay().await?;
-
-        let relay_url = format!("http://{}", server.http_addr().unwrap());
-        let relay_url: RelayUrl = relay_url.parse()?;
-
-        let client_config = CaTlsConfig::default()
-            .client_config(default_provider())
-            .unwrap();
-
-        // set up client a
-        let a_secret_key = SecretKey::from_bytes(&rng.random());
-        let a_key = a_secret_key.public();
-        let resolver = dns_resolver();
-        info!("client a build & connect");
-        let mut client_a = ClientBuilder::new(relay_url.clone(), a_secret_key, resolver.clone())
-            .tls_client_config(client_config.clone())
-            .connect()
-            .await?;
-
-        // set up client b
-        let b_secret_key = SecretKey::from_bytes(&rng.random());
-        let b_key = b_secret_key.public();
-        info!("client b build & connect");
-        let mut client_b = ClientBuilder::new(relay_url.clone(), b_secret_key, resolver.clone())
-            .tls_client_config(client_config)
-            .connect()
-            .await?;
-
-        info!("sending a -> b");
-
-        // send message from a to b
-        let msg = Datagrams::from("hello, b");
-        let res = try_send_recv(&mut client_a, &mut client_b, b_key, msg.clone()).await?;
-        let RelayToClientMsg::Datagrams {
-            remote_endpoint_id,
-            datagrams,
-        } = res
-        else {
-            panic!("client_b received unexpected message {res:?}");
-        };
-
-        assert_eq!(a_key, remote_endpoint_id);
-        assert_eq!(msg, datagrams);
-
-        info!("sending b -> a");
-        // send message from b to a
-        let msg = Datagrams::from("howdy, a");
-        let res = try_send_recv(&mut client_b, &mut client_a, a_key, msg.clone()).await?;
-
-        let RelayToClientMsg::Datagrams {
-            remote_endpoint_id,
-            datagrams,
-        } = res
-        else {
-            panic!("client_a received unexpected message {res:?}");
-        };
-
-        assert_eq!(b_key, remote_endpoint_id);
-        assert_eq!(msg, datagrams);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_relay_access_control() -> Result<()> {
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
-        let current_span = tracing::info_span!("this is a test");
-        let _guard = current_span.enter();
-
-        let client_config = CaTlsConfig::default()
-            .client_config(default_provider())
-            .unwrap();
-
-        let a_secret_key = SecretKey::from_bytes(&rng.random());
-        let a_key = a_secret_key.public();
-
-        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-        relay.key_cache_capacity = Some(1024);
-        relay.access = Arc::new(TestAccess(Box::new(move |request| {
-            let endpoint_id = request.endpoint_id();
-            info!("checking {}", endpoint_id);
-            // reject endpoint a
-            if endpoint_id == a_key {
-                Access::Deny { reason: None }
-            } else {
-                Access::Allow
-            }
-        })));
-        let server = Server::spawn(ServerConfig {
-            relay: Some(relay),
-            quic: None,
-            metrics_addr: None,
-        })
-        .await?;
-
-        let relay_url = format!("http://{}", server.http_addr().unwrap());
-        let relay_url: RelayUrl = relay_url.parse()?;
-
-        // set up client a
-        let resolver = dns_resolver();
-        let result = ClientBuilder::new(relay_url.clone(), a_secret_key, resolver)
-            .tls_client_config(client_config.clone())
-            .connect()
-            .await;
-
-        assert!(
-            matches!(result, Err(ConnectError::Handshake { source: handshake::Error::ServerDeniedAuth { reason, .. }, .. }) if reason == "not authorized")
-        );
-
-        // test that another client has access
-
-        // set up client b
-        let b_secret_key = SecretKey::from_bytes(&rng.random());
-        let b_key = b_secret_key.public();
-
-        let resolver = dns_resolver();
-        let mut client_b = ClientBuilder::new(relay_url.clone(), b_secret_key, resolver)
-            .tls_client_config(client_config.clone())
-            .connect()
-            .await?;
-
-        // set up client c
-        let c_secret_key = SecretKey::from_bytes(&rng.random());
-        let c_key = c_secret_key.public();
-
-        let resolver = dns_resolver();
-        let mut client_c = ClientBuilder::new(relay_url.clone(), c_secret_key, resolver)
-            .tls_client_config(client_config)
-            .connect()
-            .await?;
-
-        // send message from b to c
-        let msg = Datagrams::from("hello, c");
-        let res = try_send_recv(&mut client_b, &mut client_c, c_key, msg.clone()).await?;
-
-        if let RelayToClientMsg::Datagrams {
-            remote_endpoint_id,
-            datagrams,
-        } = res
-        {
-            assert_eq!(b_key, remote_endpoint_id);
-            assert_eq!(msg, datagrams);
-        } else {
-            panic!("client_c received unexpected message {res:?}");
-        }
-
-        Ok(())
-    }
-
-    /// Verifies that [`ClientBuilder::auth_token`] forwards a token to the
-    /// relay so the [`AccessControl::on_connect`] hook can read it via
-    /// [`ClientRequest::auth_token`].
-    #[tokio::test]
-    #[traced_test]
-    async fn test_relay_client_auth_token_forwarded() -> Result<()> {
-        const TOKEN: &str = "secret-token";
-
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
-        let client_config = CaTlsConfig::default()
-            .client_config(default_provider())
-            .unwrap();
-
-        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-        relay.key_cache_capacity = Some(1024);
-        relay.access = Arc::new(TestAccess(Box::new(move |request| {
-            if request.auth_token().as_deref() == Some(TOKEN) {
-                Access::Allow
-            } else {
-                Access::Deny { reason: None }
-            }
-        })));
-        let server = Server::spawn(ServerConfig {
-            relay: Some(relay),
-            quic: None,
-            metrics_addr: None,
-        })
-        .await?;
-
-        let relay_url = format!("http://{}", server.http_addr().unwrap());
-        let relay_url: RelayUrl = relay_url.parse()?;
-
-        // No query param: denied.
-        let secret_key = SecretKey::from_bytes(&rng.random());
-        let result = ClientBuilder::new(relay_url.clone(), secret_key, dns_resolver())
-            .tls_client_config(client_config.clone())
-            .connect()
-            .await;
-        assert!(matches!(
-            result,
-            Err(ConnectError::Handshake { source: handshake::Error::ServerDeniedAuth { reason, .. }, .. })
-                if reason == "not authorized"
-        ));
-
-        // Wrong token: denied.
-        let secret_key = SecretKey::from_bytes(&rng.random());
-        let result = ClientBuilder::new(relay_url.clone(), secret_key, dns_resolver())
-            .tls_client_config(client_config.clone())
-            .auth_token("wrong-token")
-            .connect()
-            .await;
-        assert!(matches!(
-            result,
-            Err(ConnectError::Handshake { source: handshake::Error::ServerDeniedAuth { reason, .. }, .. })
-                if reason == "not authorized"
-        ));
-
-        // Correct token: connection succeeds.
-        let secret_key = SecretKey::from_bytes(&rng.random());
-        let _client = ClientBuilder::new(relay_url, secret_key, dns_resolver())
-            .tls_client_config(client_config)
-            .auth_token(TOKEN)
-            .connect()
-            .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_relay_clients_full() -> Result<()> {
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
-        let server = spawn_local_relay().await.unwrap();
-        let relay_url = format!("http://{}", server.http_addr().unwrap());
-        let relay_url: RelayUrl = relay_url.parse().unwrap();
-
-        let client_config = CaTlsConfig::default()
-            .client_config(default_provider())
-            .unwrap();
-
-        // set up client a
-        let a_secret_key = SecretKey::from_bytes(&rng.random());
-        let resolver = dns_resolver();
-        let mut client_a = ClientBuilder::new(relay_url.clone(), a_secret_key, resolver.clone())
-            .tls_client_config(client_config.clone())
-            .connect()
-            .await?;
-
-        // set up client b
-        let b_secret_key = SecretKey::from_bytes(&rng.random());
-        let b_key = b_secret_key.public();
-        let _client_b = ClientBuilder::new(relay_url.clone(), b_secret_key, resolver.clone())
-            .tls_client_config(client_config)
-            .connect()
-            .await?;
-
-        // send messages from a to b, without b receiving anything.
-        // we should still keep succeeding to send, even if the packet won't be forwarded
-        // by the relay server because the server's send queue for b fills up.
-        let msg = Datagrams::from("hello, b");
-        for _i in 0..1000 {
-            client_a
-                .send(ClientToRelayMsg::Datagrams {
-                    dst_endpoint_id: b_key,
-                    datagrams: msg.clone(),
-                })
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Regression test: A relay client that prefers IPv6 falls back to IPv4
-    /// when the advertised IPv6 address is unreachable.
-    #[tokio::test]
-    #[traced_test]
-    async fn test_relay_client_falls_back_to_ipv4() -> Result {
-        // A relay reachable only over IPv4.
-        let config = ServerConfig {
-            relay: Some(RelayConfig::new((Ipv4Addr::LOCALHOST, 0))),
-            ..Default::default()
-        };
-        let server = Server::spawn(config).await?;
-        let addr = server.http_addr().expect("http relay address");
-
-        // Resolves to both the real IPv4 address and an unreachable IPv6 address.
-        let resolver = static_resolver(
-            vec![Ipv4Addr::LOCALHOST],
-            vec!["2001:db8::dead".parse().expect("valid IPv6")],
-        );
-        let url: Url = format!("http://relay.test:{}", addr.port())
-            .parse()
-            .expect("valid relay url");
-
-        let client = ClientBuilder::new(url, SecretKey::generate(), resolver)
-            .tls_client_config(tls::make_dangerous_client_config())
-            // Force IPv6 preference
-            .address_family_selector(|| true);
-
-        tokio::time::timeout(Duration::from_secs(10), client.connect())
-            .await
-            .with_std_context(|_| "relay connect timed out")?
-            .context("relay connect")?;
-
-        server.shutdown().await.context("relay server shutdown")?;
-        Ok(())
     }
 }
