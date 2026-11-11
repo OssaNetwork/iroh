@@ -29,6 +29,15 @@ pub struct Metrics {
     /// Number of times a client could not get a port because binding its socket failed.
     pub allocations_bind_failed: Counter,
 
+    /// Number of tunnels opened by dialers.
+    ///
+    /// The number of open tunnels at any time is `tunnels_opened` - `tunnels_closed`.
+    pub tunnels_opened: Counter,
+    /// Number of tunnels closed.
+    pub tunnels_closed: Counter,
+    /// Number of tunnels refused because too many were open to the allocation.
+    pub tunnels_rejected: Counter,
+
     /*
      * Metrics about packets
      */

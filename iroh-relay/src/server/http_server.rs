@@ -33,7 +33,10 @@ use super::{SpawnError, relay::Relay};
 use crate::{
     http::{SUPPORTED_WEBSOCKET_VERSION, WEBSOCKET_UPGRADE_PROTOCOL},
     protos::{
-        relay::{CONTROL_RELATIVE_PATH, CONTROL_SUBPROTOCOL, MAX_FRAME_SIZE},
+        relay::{
+            CONTROL_RELATIVE_PATH, CONTROL_SUBPROTOCOL, MAX_FRAME_SIZE, MAX_TUNNEL_FRAME_SIZE,
+            TUNNEL_RELATIVE_PATH_PREFIX, TUNNEL_SUBPROTOCOL,
+        },
         streams::WsBytesFramed,
     },
     server::{metrics::Metrics, streams::MaybeTlsStream},
@@ -541,9 +544,8 @@ impl RelayService {
 
     /// Answers a WebSocket upgrade request.
     ///
-    /// Once the connection is upgraded `serve` is called with the WebSocket and the head
-    /// of the request. It has until `deadline`, passed to it, to establish whatever it
-    /// serves.
+    /// Once the connection is upgraded `serve` is called with the WebSocket and what is
+    /// known about the request.
     fn handle_ws_upgrade<F, Fut>(
         &self,
         mut req: Request<Incoming>,
@@ -552,9 +554,7 @@ impl RelayService {
         serve: F,
     ) -> HyperResult<Response<BytesBody>>
     where
-        F: FnOnce(WsBytesFramed<MaybeTlsStream>, http::request::Parts, Instant) -> Fut
-            + Send
-            + 'static,
+        F: FnOnce(WsBytesFramed<MaybeTlsStream>, UpgradedRequest) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send,
     {
         let key = match check_ws_upgrade(&req, subprotocol) {
@@ -608,6 +608,7 @@ impl RelayService {
                     return;
                 }
                 io.disable_nagle();
+                let peer = io.peer_addr().ok();
                 let websocket = tokio_websockets::ServerBuilder::new()
                     .limits(
                         tokio_websockets::Limits::default().max_payload_len(Some(max_payload_len)),
@@ -615,7 +616,12 @@ impl RelayService {
                     // Serve will create a WebSocketStream on an already upgraded connection
                     .serve(io);
                 let (parts, _) = req.into_parts();
-                serve(WsBytesFramed { io: websocket }, parts, deadline).await;
+                let request = UpgradedRequest {
+                    parts,
+                    deadline,
+                    peer,
+                };
+                serve(WsBytesFramed { io: websocket }, request).await;
             }
             .instrument(info_span!("handler")),
         );
@@ -648,9 +654,9 @@ impl RelayService {
             req,
             CONTROL_SUBPROTOCOL,
             MAX_FRAME_SIZE,
-            move |io, parts, deadline| async move {
-                let accept = relay.accept_control(io, parts.uri, parts.headers);
-                match tokio::time::timeout_at(deadline, accept).await {
+            move |io, request| async move {
+                let accept = relay.accept_control(io, request.parts.uri, request.parts.headers);
+                match tokio::time::timeout_at(request.deadline, accept).await {
                     Ok(Ok(connection)) => connection.run().await,
                     Ok(Err(err)) => debug!("control channel not accepted: {err:#}"),
                     Err(_) => debug!("control channel establishment timed out"),
@@ -658,6 +664,47 @@ impl RelayService {
             },
         )
     }
+}
+
+impl RelayService {
+    /// Upgrades the connection to the tunnel of a dialer to the allocation on `port`.
+    fn handle_tunnel(
+        &self,
+        relay: Relay,
+        port: u16,
+        req: Request<Incoming>,
+    ) -> HyperResult<Response<BytesBody>> {
+        // Refuse before the upgrade. A dialer takes a rejected upgrade to mean that
+        // there is no fallback at this address.
+        if !relay.has_port(port) {
+            return self.0.not_found_fn(req, self.0.default_response());
+        }
+        self.handle_ws_upgrade(
+            req,
+            TUNNEL_SUBPROTOCOL,
+            MAX_TUNNEL_FRAME_SIZE,
+            move |io, request| async move {
+                let Some(peer) = request.peer else {
+                    debug!("tunnel without a peer address");
+                    return;
+                };
+                match relay.open_tunnel(port, peer) {
+                    Ok(tunnel) => tunnel.run(io).await,
+                    Err(err) => debug!("tunnel not opened: {err:#}"),
+                }
+            },
+        )
+    }
+}
+
+/// What is known about a request once its connection was upgraded to a WebSocket.
+struct UpgradedRequest {
+    /// The head of the request.
+    parts: http::request::Parts,
+    /// Until when whatever is served on the WebSocket has to be established.
+    deadline: Instant,
+    /// The address of the remote end of the connection.
+    peer: Option<SocketAddr>,
 }
 
 impl Service<Request<Incoming>> for RelayService {
@@ -672,6 +719,21 @@ impl Service<Request<Incoming>> for RelayService {
             && uri.path().strip_prefix('/') == Some(CONTROL_RELATIVE_PATH)
         {
             return std::future::ready(self.handle_control(relay.clone(), req));
+        }
+        if let Some(relay) = &self.0.relay
+            && req.method() == Method::GET
+            && let Some(port) = uri
+                .path()
+                .strip_prefix('/')
+                .and_then(|path| path.strip_prefix(TUNNEL_RELATIVE_PATH_PREFIX))
+        {
+            // Only the canonical decimal form names a port.
+            return std::future::ready(match port.parse::<u16>() {
+                Ok(parsed) if parsed != 0 && parsed.to_string() == port => {
+                    self.handle_tunnel(relay.clone(), parsed, req)
+                }
+                _ => self.0.not_found_fn(req, self.0.default_response()),
+            });
         }
 
         if let Some(handler) = self.0.handlers.get(&(req.method().clone(), uri.path())) {

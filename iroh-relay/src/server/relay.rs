@@ -9,15 +9,22 @@
 //! reconnects in time keeps its port, and the socket stays bound in between so that no
 //! one else can take it. Packets arriving for a client that is not connected are dropped.
 //!
+//! A dialer whose network blocks UDP reaches an allocation through a *tunnel* instead: a
+//! WebSocket to the relay on which every message is one QUIC packet. To the client a
+//! tunnelled dialer is one more remote party, marked as tunnelled.
+//!
 //! [`Relay`] is the entry point. [`Relay::accept_control`] takes a WebSocket that a client
 //! opened and returns a [`ControlConnection`] once the client is authenticated and has
-//! its allocation.
+//! its allocation. [`Relay::open_tunnel`] attaches a dialer's WebSocket to an allocation.
 
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::RangeInclusive,
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
@@ -77,6 +84,17 @@ const CLOSING_POLL: Duration = Duration::from_millis(5);
 /// How long the reader of an allocation pauses after its socket reported an error.
 const READ_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 
+/// The default number of tunnels that can be open to one allocation.
+pub const DEFAULT_MAX_TUNNELS: usize = 64;
+
+/// How many packets wait for a tunnel before the relay drops packets.
+const TUNNEL_QUEUE_DEPTH: usize = 128;
+
+/// How long a tunnel may carry no packets before the relay closes it.
+///
+/// A QUIC connection with keep-alives never lets its tunnel idle this long.
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The size of the buffers packets are received into.
 ///
 /// One buffer serves several packets. It is released once all of them left the relay.
@@ -110,6 +128,9 @@ pub struct AllocationConfig {
     /// The largest QUIC packet the relay forwards, larger packets are dropped. Defaults
     /// to [`DEFAULT_MAX_PACKET_SIZE`].
     pub max_packet_size: usize,
+    /// How many tunnels can be open to one allocation at a time. Defaults to
+    /// [`DEFAULT_MAX_TUNNELS`]. With 0 the relay does not serve tunnels.
+    pub max_tunnels: usize,
     /// Decides which clients may open a control channel, and their identity.
     pub authenticator: Arc<dyn DynAuthenticator>,
     /// Decides which packets are forwarded.
@@ -129,6 +150,7 @@ impl AllocationConfig {
             ports: DEFAULT_PORT_RANGE,
             release_timeout: DEFAULT_RELEASE_TIMEOUT,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            max_tunnels: DEFAULT_MAX_TUNNELS,
             authenticator,
             policy,
         }
@@ -157,6 +179,17 @@ pub enum AcceptError {
     },
     #[error("the relay is shutting down")]
     Shutdown,
+}
+
+/// Errors when opening a tunnel.
+#[stack_error(derive, add_meta)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum TunnelError {
+    #[error("no allocation has port {port}")]
+    UnknownPort { port: u16 },
+    #[error("too many tunnels are open to the allocation")]
+    TooManyTunnels,
 }
 
 /// The configuration of a [`Relay`] is not usable.
@@ -188,6 +221,8 @@ struct Inner {
     metrics: Arc<Metrics>,
     /// Frees allocations when their release timeout passes.
     expiry_task: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// Counts the addresses made up for tunnels.
+    next_tunnel_name: AtomicU32,
 }
 
 #[derive(Debug)]
@@ -208,6 +243,7 @@ impl State {
     /// Removes the allocation of `identity`. Its socket closes shortly after.
     fn remove_allocation(&mut self, identity: &ClientId) {
         if let Some(allocation) = self.allocations.remove(identity) {
+            allocation.shared.released.cancel();
             self.closing
                 .push((allocation.shared.port, Arc::downgrade(&allocation.shared)));
         }
@@ -237,6 +273,12 @@ struct AllocationShared {
     policy: Mutex<Box<dyn AllocationPolicy>>,
     /// The control channel of the client, if it is connected.
     attached: Mutex<Option<Attachment>>,
+    /// The tunnels of dialers that can not reach the socket over UDP, by the address that
+    /// identifies each to the client.
+    tunnels: Mutex<HashMap<SocketAddrV4, mpsc::Sender<Bytes>>>,
+    max_tunnels: usize,
+    /// Cancelled when the allocation is released. Closes its tunnels.
+    released: CancellationToken,
     metrics: Arc<Metrics>,
 }
 
@@ -311,8 +353,15 @@ impl AllocationShared {
             || addr.ip().is_unspecified()
             || addr.ip().is_broadcast()
             || addr.ip().is_multicast();
-        // Tunnelled remote parties are not served yet.
-        if invalid || remote.tunnel || payload.is_empty() || payload.len() > self.max_packet_size {
+        if payload.is_empty() || payload.len() > self.max_packet_size {
+            self.metrics.packets_dropped_invalid.inc();
+            return;
+        }
+        if remote.tunnel {
+            self.send_to_tunnel(remote, payload);
+            return;
+        }
+        if invalid {
             self.metrics.packets_dropped_invalid.inc();
             return;
         }
@@ -330,6 +379,45 @@ impl AllocationShared {
                 self.metrics.packets_dropped_send_failed.inc();
             }
         }
+    }
+
+    /// Writes a packet of the client to the tunnel of a remote party.
+    fn send_to_tunnel(&self, remote: RemoteAddr, payload: Bytes) {
+        let tunnels = lock(&self.tunnels);
+        // The address of a tunnelled remote party is only a name for its tunnel. Without
+        // the tunnel there is nothing to send to.
+        let Some(tunnel) = tunnels.get(&remote.addr) else {
+            self.metrics.packets_dropped_invalid.inc();
+            return;
+        };
+        if !self.allowed(Direction::Outbound, remote, &payload) {
+            return;
+        }
+        let len = payload.len();
+        match tunnel.try_send(payload) {
+            Ok(()) => {
+                self.metrics.packets_outbound.inc();
+                self.metrics.bytes_outbound.inc_by(len as u64);
+            }
+            Err(_) => {
+                self.metrics.packets_dropped_send_failed.inc();
+            }
+        }
+    }
+
+    /// Checks a packet that arrived for the client. Returns whether to deliver it.
+    fn accepts_inbound(&self, remote: RemoteAddr, payload: &[u8]) -> bool {
+        if payload.is_empty() || payload.len() > self.max_packet_size {
+            self.metrics.packets_dropped_invalid.inc();
+            return false;
+        }
+        // A packet for a client that is away is dropped before the policy sees it. It
+        // must not use up the client's rate limit, or count as contact with the sender.
+        if lock(&self.attached).is_none() {
+            self.metrics.packets_dropped_detached.inc();
+            return false;
+        }
+        self.allowed(Direction::Inbound, remote, payload)
     }
 
     /// Reads packets from the socket and queues them for the client.
@@ -370,19 +458,9 @@ impl AllocationShared {
             let SocketAddr::V4(from) = from else {
                 continue;
             };
-            if len == 0 || len > self.max_packet_size {
-                self.metrics.packets_dropped_invalid.inc();
-                continue;
-            }
-            // A packet for a client that is away is dropped before the policy sees it. It
-            // must not use up the client's rate limit, or count as contact with the
-            // sender.
-            if lock(&self.attached).is_none() {
-                self.metrics.packets_dropped_detached.inc();
-                continue;
-            }
+            debug_assert_eq!(frame.len(), DATAGRAM_HEADER_LEN + len);
             let remote = RemoteAddr::udp(from);
-            if !self.allowed(Direction::Inbound, remote, &frame[DATAGRAM_HEADER_LEN..]) {
+            if !self.accepts_inbound(remote, &frame[DATAGRAM_HEADER_LEN..]) {
                 continue;
             }
             frame[..DATAGRAM_HEADER_LEN].copy_from_slice(&Datagram::header(remote));
@@ -415,6 +493,7 @@ impl Relay {
             shutdown: CancellationToken::new(),
             metrics,
             expiry_task: Mutex::new(None),
+            next_tunnel_name: AtomicU32::new(0),
         });
         // The task only holds a weak reference, it must not keep the relay alive.
         let weak = Arc::downgrade(&inner);
@@ -477,6 +556,61 @@ impl Relay {
         lock(&self.0.state).allocator.port_of(identity)
     }
 
+    /// Returns whether an allocation has the public port `port`.
+    ///
+    /// This includes the allocation of a client that is away and whose port is held.
+    pub fn has_port(&self, port: u16) -> bool {
+        lock(&self.0.state).allocator.owner_of(port).is_some()
+    }
+
+    /// Attaches the tunnel of a dialer to the allocation with the public port `port`.
+    ///
+    /// `peer` is the source address of the dialer's connection to the relay. It names the
+    /// dialer to the client, which sees a remote party at that address, marked as
+    /// tunnelled.
+    ///
+    /// Run the returned tunnel with [`Tunnel::run`]. Anyone may open a tunnel, as anyone
+    /// may send UDP packets to the port. The traffic policy applies to both alike.
+    pub fn open_tunnel(&self, port: u16, peer: SocketAddr) -> Result<Tunnel, TunnelError> {
+        let inner = &self.0;
+        let state = lock(&inner.state);
+        let shared = state
+            .allocator
+            .owner_of(port)
+            .and_then(|identity| state.allocations.get(identity))
+            .map(|allocation| allocation.shared.clone())
+            .ok_or_else(|| e!(TunnelError::UnknownPort { port }))?;
+        drop(state);
+
+        let mut tunnels = lock(&shared.tunnels);
+        if tunnels.len() >= shared.max_tunnels {
+            inner.metrics.tunnels_rejected.inc();
+            return Err(e!(TunnelError::TooManyTunnels));
+        }
+        let addr = match peer {
+            SocketAddr::V4(addr) if !tunnels.contains_key(&addr) => addr,
+            SocketAddr::V6(addr) => match addr.ip().to_ipv4_mapped() {
+                Some(ip) if !tunnels.contains_key(&SocketAddrV4::new(ip, addr.port())) => {
+                    SocketAddrV4::new(ip, addr.port())
+                }
+                _ => inner.made_up_tunnel_addr(&tunnels),
+            },
+            SocketAddr::V4(_) => inner.made_up_tunnel_addr(&tunnels),
+        };
+        let (outbound_tx, outbound_rx) = mpsc::channel(TUNNEL_QUEUE_DEPTH);
+        tunnels.insert(addr, outbound_tx);
+        drop(tunnels);
+        inner.metrics.tunnels_opened.inc();
+        Ok(Tunnel {
+            remote: RemoteAddr::tunnel(addr),
+            allocation: Arc::downgrade(&shared),
+            released: shared.released.clone(),
+            shutdown: inner.shutdown.clone(),
+            outbound: outbound_rx,
+            metrics: inner.metrics.clone(),
+        })
+    }
+
     /// Closes the control channel of `identity`, if it is connected.
     ///
     /// Returns whether a control channel was closed. The client's port stays reserved for
@@ -504,6 +638,9 @@ impl Relay {
         state.shutdown = true;
         self.0.shutdown.cancel();
         let released = state.allocations.len();
+        for allocation in state.allocations.values() {
+            allocation.shared.released.cancel();
+        }
         state.allocations.clear();
         state.allocator.clear();
         self.0.metrics.allocations_released.inc_by(released as u64);
@@ -748,6 +885,24 @@ impl Relay {
 }
 
 impl Inner {
+    /// Makes up an address to name a tunnel whose dialer has no usable IPv4 address.
+    ///
+    /// The address lies in 240.0.0.0/4, which is reserved and never the source of a real
+    /// packet.
+    fn made_up_tunnel_addr(
+        &self,
+        tunnels: &HashMap<SocketAddrV4, mpsc::Sender<Bytes>>,
+    ) -> SocketAddrV4 {
+        loop {
+            let n = self.next_tunnel_name.fetch_add(1, Ordering::Relaxed);
+            let ip = Ipv4Addr::from(0xf000_0000 | (n & 0x0fff_ffff));
+            let addr = SocketAddrV4::new(ip, 1);
+            if !tunnels.contains_key(&addr) {
+                return addr;
+            }
+        }
+    }
+
     /// Frees the allocations whose release timeout has passed.
     fn expire(&self, state: &mut State, now: Instant) {
         for (identity, port) in state.allocator.expire(now) {
@@ -769,6 +924,9 @@ impl Inner {
             max_packet_size: self.config.max_packet_size,
             policy: Mutex::new(self.config.policy.allocation(identity)),
             attached: Mutex::new(None),
+            tunnels: Mutex::new(HashMap::new()),
+            max_tunnels: self.config.max_tunnels,
+            released: CancellationToken::new(),
             metrics: self.metrics.clone(),
         });
         let reader = tokio::spawn(
@@ -1003,6 +1161,101 @@ async fn serve<S: BytesStreamSink>(io: &mut S, attached: &mut Attached, relay: &
                     && !send_frame(io, &RelayFrame::Control(control)).await
                 {
                     return Exit::silent("write failed");
+                }
+            }
+        }
+    }
+}
+
+/// The tunnel of a dialer to an allocation.
+///
+/// Created with [`Relay::open_tunnel`].
+#[derive(Debug)]
+pub struct Tunnel {
+    remote: RemoteAddr,
+    allocation: Weak<AllocationShared>,
+    released: CancellationToken,
+    shutdown: CancellationToken,
+    /// Packets of the client for the dialer.
+    outbound: mpsc::Receiver<Bytes>,
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        if let Some(allocation) = self.allocation.upgrade() {
+            lock(&allocation.tunnels).remove(&self.remote.addr);
+        }
+        self.metrics.tunnels_closed.inc();
+    }
+}
+
+impl Tunnel {
+    /// Returns how the dialer appears to the client.
+    pub fn remote(&self) -> RemoteAddr {
+        self.remote
+    }
+
+    /// Serves the tunnel on the dialer's WebSocket `io` until it closes.
+    ///
+    /// Every message on `io` is one QUIC packet.
+    pub async fn run<S: BytesStreamSink>(mut self, mut io: S) {
+        let span = info_span!("tunnel", remote = %self.remote.addr);
+        async {
+            let reason = self.serve(&mut io).await;
+            debug!("tunnel closed: {reason}");
+            let _ = time::timeout(WRITE_TIMEOUT, io.close()).await;
+        }
+        .instrument(span)
+        .await;
+    }
+
+    async fn serve<S: BytesStreamSink>(&mut self, io: &mut S) -> &'static str {
+        let idle = time::sleep(TUNNEL_IDLE_TIMEOUT);
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                _ = self.released.cancelled() => return "the allocation was released",
+                _ = self.shutdown.cancelled() => return "relay is shutting down",
+                _ = &mut idle => return "idle",
+                first = self.outbound.recv() => {
+                    // The sender lives in the allocation.
+                    let Some(first) = first else {
+                        return "the allocation was released";
+                    };
+                    let write = async {
+                        io.feed(first).await?;
+                        for _ in 1..WRITE_BATCH {
+                            match self.outbound.try_recv() {
+                                Ok(packet) => io.feed(packet).await?,
+                                Err(_) => break,
+                            }
+                        }
+                        io.flush().await
+                    };
+                    if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
+                        return "write failed";
+                    }
+                    idle.as_mut().reset(Instant::now() + TUNNEL_IDLE_TIMEOUT);
+                }
+                packet = io.next() => {
+                    let packet = match packet {
+                        Some(Ok(packet)) => packet,
+                        Some(Err(_)) => return "read failed",
+                        None => return "closed by the dialer",
+                    };
+                    idle.as_mut().reset(Instant::now() + TUNNEL_IDLE_TIMEOUT);
+                    // The tunnel must not keep the allocation alive.
+                    let Some(allocation) = self.allocation.upgrade() else {
+                        return "the allocation was released";
+                    };
+                    if !allocation.accepts_inbound(self.remote, &packet) {
+                        continue;
+                    }
+                    let mut frame = BytesMut::with_capacity(DATAGRAM_HEADER_LEN + packet.len());
+                    frame.put_slice(&Datagram::header(self.remote));
+                    frame.put_slice(&packet);
+                    allocation.deliver(frame.freeze());
                 }
             }
         }

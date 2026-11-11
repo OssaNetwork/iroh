@@ -25,6 +25,14 @@ pub enum MaybeTlsStream {
 }
 
 impl MaybeTlsStream {
+    /// Returns the address of the remote end of the TCP stream.
+    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        match self {
+            Self::Plain(stream) => stream.peer_addr(),
+            Self::Tls(stream) => stream.get_ref().0.peer_addr(),
+        }
+    }
+
     /// Tries to disable the nagle algorithm on the TCP stream.
     ///
     /// This sets the NO_DELAY option on the TCP stream, which turns off the

@@ -15,7 +15,11 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, trace, warn};
 
-use super::{ConnectError, WsConnection, WsDialer, addr::RelayIndex, socket::Registration};
+use super::{
+    ConnectError, WsConnection, WsDialer,
+    addr::{PathAddr, RelayIndex},
+    socket::Registration,
+};
 use crate::{
     auth::{CHANNEL_BINDING_LEN, SharedToken, channel_binding},
     protos::{
@@ -290,11 +294,11 @@ impl LinkState {
     }
 }
 
-/// A packet received through a relay, together with the relay it came through.
+/// A packet received through a relay, together with the path it came on.
 #[derive(Debug)]
 pub(super) struct Inbound {
-    pub(super) relay: RelayIndex,
-    pub(super) datagram: Datagram,
+    pub(super) from: PathAddr,
+    pub(super) payload: Bytes,
 }
 
 /// A connection to a relay that is kept open in the background.
@@ -524,7 +528,13 @@ impl Actor {
                     idle.as_mut().reset(time::Instant::now() + IDLE_TIMEOUT);
                     let reply = match frame {
                         RelayFrame::Datagram(datagram) => {
-                            let inbound = Inbound { relay: self.index, datagram };
+                            let inbound = Inbound {
+                                from: PathAddr::Relayed {
+                                    relay: self.index,
+                                    remote: datagram.remote,
+                                },
+                                payload: datagram.payload,
+                            };
                             // A full queue means the QUIC stack is not keeping up.
                             if self.inbound.try_send(inbound).is_err() {
                                 trace!("inbound queue full, dropping packet");

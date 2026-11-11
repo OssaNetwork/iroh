@@ -30,15 +30,19 @@ use crate::{
 
 mod addr;
 mod link;
+mod race;
 mod socket;
 pub(crate) mod streams;
 mod tls;
+mod tunnel;
 mod util;
 
 pub use self::{
     addr::{PathAddr, RelayIndex},
     link::{ControlClient, ControlError, Credentials, CredentialsError, LinkState, RelayLink},
+    race::{FallbackMemory, RaceError, TUNNEL_RACE_DELAY, Winner, race_udp_and_tunnel},
     socket::{RelaySocket, RelaySocketHandle},
+    tunnel::{TunnelConfig, TunnelLink, TunnelState},
 };
 
 /// Connection errors.

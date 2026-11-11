@@ -10,6 +10,7 @@ const PREFIX: [u8; 6] = [0xfd, 0x72, 0x65, 0x6c, 0x61, 0x79];
 /// The byte after the prefix says what kind of path the address stands for.
 const KIND_RELAYED_UDP: u8 = 1;
 const KIND_RELAYED_TUNNEL: u8 = 2;
+const KIND_TUNNEL: u8 = 3;
 
 /// Returns whether `addr` lies in the range of the synthetic addresses.
 pub(super) fn is_synthetic(addr: &SocketAddr) -> bool {
@@ -48,6 +49,12 @@ pub enum PathAddr {
         /// The peer's address as the relay saw it.
         remote: RemoteAddr,
     },
+    /// The peer is reached through a TCP tunnel to its relay, because UDP to the relay
+    /// does not get through.
+    Tunnel {
+        /// The address the peer advertises: the IP of its relay and its port there.
+        target: SocketAddrV4,
+    },
 }
 
 impl PathAddr {
@@ -61,14 +68,19 @@ impl PathAddr {
         if octets[..6] != PREFIX {
             return Self::Direct(SocketAddr::new(v6.ip().to_canonical(), v6.port()));
         }
+        let ip = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
         let tunnel = match octets[6] {
             KIND_RELAYED_UDP => false,
             KIND_RELAYED_TUNNEL => true,
+            KIND_TUNNEL => {
+                return Self::Tunnel {
+                    target: SocketAddrV4::new(ip, v6.port()),
+                };
+            }
             // Not an address this version creates. Nothing can be sent to it.
             _ => return Self::Direct(addr),
         };
         let relay = RelayIndex(u16::from_be_bytes([octets[8], octets[9]]));
-        let ip = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
         Self::Relayed {
             relay,
             remote: RemoteAddr {
@@ -99,12 +111,20 @@ impl PathAddr {
                 octets[12..16].copy_from_slice(&remote.addr.ip().octets());
                 SocketAddrV6::new(Ipv6Addr::from(octets), remote.addr.port(), 0, 0).into()
             }
+            Self::Tunnel { target } => {
+                let mut octets = [0u8; 16];
+                octets[..6].copy_from_slice(&PREFIX);
+                octets[6] = KIND_TUNNEL;
+                octets[12..16].copy_from_slice(&target.ip().octets());
+                SocketAddrV6::new(Ipv6Addr::from(octets), target.port(), 0, 0).into()
+            }
         }
     }
 
-    /// Returns whether the path goes through a relay.
+    /// Returns whether the path goes through a relay, in either role: a peer that
+    /// reached us through our relay, or a peer we reach through a tunnel to its relay.
     pub fn is_relayed(&self) -> bool {
-        matches!(self, Self::Relayed { .. })
+        matches!(self, Self::Relayed { .. } | Self::Tunnel { .. })
     }
 }
 
@@ -136,6 +156,18 @@ mod tests {
             path.to_socket_addr().to_string(),
             "[fd72:656c:6179:100:102:0:c633:6407]:4433"
         );
+    }
+
+    #[test]
+    fn tunnel_round_trip() {
+        let target = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 41873);
+        let path = PathAddr::Tunnel { target };
+        let addr = path.to_socket_addr();
+        assert_eq!(addr.to_string(), "[fd72:656c:6179:300::cb00:7105]:41873");
+        assert_eq!(PathAddr::from_socket_addr(addr), path);
+        assert!(path.is_relayed());
+        // Not the same address as the target reached over UDP.
+        assert_ne!(addr, PathAddr::Direct(target.into()).to_socket_addr());
     }
 
     #[test]

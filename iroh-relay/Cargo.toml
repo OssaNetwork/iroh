@@ -137,6 +137,10 @@ name = "control"
 required-features = ["server", "test-utils"]
 
 [[test]]
+name = "tunnel"
+required-features = ["server", "test-utils"]
+
+[[test]]
 name = "socket"
 required-features = ["server", "test-utils"]
 

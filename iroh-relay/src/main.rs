@@ -166,6 +166,13 @@ struct AllocationsConfig {
     release_timeout_secs: Option<u64>,
     /// The largest QUIC packet forwarded, in bytes. Defaults to 1500.
     max_packet_size: Option<usize>,
+    /// How many TCP tunnels can be open to one client at a time. Defaults to 64. With 0
+    /// the relay does not serve tunnels.
+    ///
+    /// A dialer whose network blocks UDP reaches a client through a tunnel on TCP port
+    /// 443 of the relay's public address. For that the relay's HTTPS server has to
+    /// listen on that port, with a certificate for the public IP address.
+    max_tunnels: Option<usize>,
     /// The tokens clients present to use the relay.
     ///
     /// A client names itself and presents one of these tokens. Anyone who knows a token
@@ -304,6 +311,9 @@ impl AllocationsConfig {
             .map(Duration::from_secs)
             .unwrap_or(relay::allocator::DEFAULT_RELEASE_TIMEOUT);
         config.max_packet_size = max_packet_size;
+        if let Some(max_tunnels) = self.max_tunnels {
+            config.max_tunnels = max_tunnels;
+        }
         Ok(config)
     }
 }
@@ -730,6 +740,7 @@ mod tests {
         assert_eq!(allocations.ports, 1024..=65535);
         assert_eq!(allocations.release_timeout, Duration::from_secs(30));
         assert_eq!(allocations.max_packet_size, 1500);
+        assert_eq!(allocations.max_tunnels, 64);
 
         let config = Config::from_str(
             r#"
@@ -740,6 +751,7 @@ mod tests {
             port_range_end = 50000
             release_timeout_secs = 0
             max_packet_size = 1400
+            max_tunnels = 0
             shared_tokens = ["token"]
         "#,
         )?;
@@ -749,6 +761,7 @@ mod tests {
         assert_eq!(allocations.ports, 40000..=50000);
         assert_eq!(allocations.release_timeout, Duration::ZERO);
         assert_eq!(allocations.max_packet_size, 1400);
+        assert_eq!(allocations.max_tunnels, 0);
 
         for invalid in [
             // No tokens, and an empty token.

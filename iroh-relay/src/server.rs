@@ -12,6 +12,8 @@
 //! The relay server hosts the following services:
 //!
 //! - HTTPS `/control`: The control channel of a client, see [`relay`].
+//! - HTTPS `/tunnel/<port>`: The tunnel of a dialer that can not reach the client on
+//!   `<port>` over UDP.
 //! - HTTPS `/ping`: Used for net_report probes.
 //! - HTTPS `/generate_204`: Used for net_report probes.
 
@@ -65,7 +67,7 @@ pub use self::{
         AllocationPolicy, DefaultPolicy, DefaultPolicyConfig, Direction, ForwardAll,
         InvalidPolicyConfig, Packet, RateLimit, TrafficPolicy, Verdict,
     },
-    relay::{AllocationConfig, ControlConnection, InvalidConfig, Relay},
+    relay::{AllocationConfig, ControlConnection, InvalidConfig, Relay, Tunnel, TunnelError},
     resolver::{DEFAULT_CERT_RELOAD_INTERVAL, reloading_resolver},
 };
 

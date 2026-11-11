@@ -51,6 +51,9 @@ public_ip = "203.0.113.5"
 # release_timeout_secs = 30
 # The largest QUIC packet forwarded. Defaults to 1500.
 # max_packet_size = 1500
+# How many TCP tunnels can be open to one client. Defaults to 64, with 0 the
+# relay does not serve tunnels.
+# max_tunnels = 64
 # The tokens clients present to use the relay.
 shared_tokens = ["token-a", "token-b"]
 ```
@@ -58,6 +61,22 @@ shared_tokens = ["token-a", "token-b"]
 A client that reconnects within the release timeout keeps its port. One
 relay address serves at most one client per port, so the port range bounds
 the number of clients.
+
+### TCP fallback
+
+A dialer whose network blocks UDP can not reach a client's port. It can open
+a tunnel instead: a WebSocket to `/tunnel/<port>` on TCP port 443 of the same
+IP address, on which every message is one QUIC packet. The QUIC connection
+inside is still end to end between the dialer and the client.
+
+For this to work the relay's HTTPS server has to listen on port 443 of the
+public address, and present a certificate that is valid for that IP address.
+Dialers have nothing but the IP address to verify the relay against. Use
+`cert_mode = "Manual"` or `"Reloading"` with a certificate issued for the IP
+address.
+
+The dialer needs code for this, a stock QUIC client only speaks UDP. See
+`RelaySocketHandle::open_tunnel` and `race_udp_and_tunnel` in the client.
 
 ### Authentication
 

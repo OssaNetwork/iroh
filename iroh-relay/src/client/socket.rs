@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::{self, IoSliceMut},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, SocketAddrV4},
     num::NonZeroUsize,
     pin::Pin,
     sync::{
@@ -26,6 +26,7 @@ use super::{
     WsDialer,
     addr::{PathAddr, RelayIndex, is_synthetic},
     link::{Credentials, Inbound, RelayLink},
+    tunnel::{TunnelConfig, TunnelLink},
 };
 use crate::protos::relay::Datagram;
 
@@ -33,9 +34,11 @@ use crate::protos::relay::Datagram;
 const INBOUND_QUEUE_DEPTH: usize = 1024;
 
 /// State shared between the socket, its senders, its handles and its links.
-struct Shared {
+pub(super) struct Shared {
     /// Where to send packets for each connected relay.
     links: RwLock<HashMap<RelayIndex, mpsc::Sender<Datagram>>>,
+    /// Where to send packets for each open tunnel, by the address the tunnel leads to.
+    tunnels: RwLock<HashMap<SocketAddrV4, mpsc::Sender<Bytes>>>,
     /// Given to every link to deliver the packets it receives.
     inbound: mpsc::Sender<Inbound>,
     /// The index the next link gets, if it is free.
@@ -71,6 +74,32 @@ impl Drop for Registration {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.upgrade() {
             shared.links_mut().remove(&self.index);
+        }
+    }
+}
+
+/// Removes a tunnel from its socket when dropped.
+#[derive(Debug)]
+pub(super) struct TunnelRegistration {
+    shared: Weak<Shared>,
+    target: SocketAddrV4,
+    /// Tells this tunnel's entry from a later one to the same target.
+    sender: mpsc::Sender<Bytes>,
+}
+
+impl Drop for TunnelRegistration {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            let mut tunnels = shared
+                .tunnels
+                .write()
+                .unwrap_or_else(|err| err.into_inner());
+            if tunnels
+                .get(&self.target)
+                .is_some_and(|sender| sender.same_channel(&self.sender))
+            {
+                tunnels.remove(&self.target);
+            }
         }
     }
 }
@@ -131,6 +160,7 @@ impl RelaySocket {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
         let shared = Arc::new(Shared {
             links: RwLock::new(HashMap::new()),
+            tunnels: RwLock::new(HashMap::new()),
             inbound: inbound_tx,
             next_index: AtomicU16::new(0),
         });
@@ -152,10 +182,10 @@ impl RelaySocket {
     ) -> Poll<io::Result<usize>> {
         let mut filled = 0;
         while filled < bufs.len().min(meta.len()) {
-            let Poll::Ready(Some(Inbound { relay, datagram })) = self.inbound.poll_recv(cx) else {
+            let Poll::Ready(Some(Inbound { from, payload })) = self.inbound.poll_recv(cx) else {
                 break;
             };
-            let len = datagram.payload.len();
+            let len = payload.len();
             if len > bufs[filled].len() {
                 trace!(
                     len,
@@ -163,13 +193,9 @@ impl RelaySocket {
                 );
                 continue;
             }
-            bufs[filled][..len].copy_from_slice(&datagram.payload);
-            let path = PathAddr::Relayed {
-                relay,
-                remote: datagram.remote,
-            };
+            bufs[filled][..len].copy_from_slice(&payload);
             let mut packet_meta = RecvMeta::default();
-            packet_meta.addr = path.to_socket_addr();
+            packet_meta.addr = from.to_socket_addr();
             packet_meta.len = len;
             packet_meta.stride = len;
             meta[filled] = packet_meta;
@@ -250,6 +276,49 @@ impl RelaySocketHandle {
             outbound_rx,
             registration,
         )
+    }
+
+    /// Opens a TCP tunnel to the peer that advertises `target`, for when UDP to `target`
+    /// does not get through.
+    ///
+    /// `target` is the address a peer advertises. If the peer is behind a relay, the
+    /// relay serves a tunnel to it on TCP port 443 of the same IP address. A peer that is
+    /// directly reachable has no such tunnel, and the link then fails.
+    ///
+    /// Dial the peer with the QUIC stack at [`TunnelLink::addr`]. Packets sent there
+    /// before the tunnel is up are held back, up to a few, so the QUIC handshake can
+    /// start right away. The link does not reconnect.
+    ///
+    /// A tunnel to the same target that is still open is replaced.
+    ///
+    /// Must be called from within a tokio runtime.
+    pub fn open_tunnel(&self, target: SocketAddrV4, config: TunnelConfig) -> TunnelLink {
+        let (link, outbound) = TunnelLink::spawn(
+            target,
+            config,
+            self.shared.inbound.clone(),
+            Arc::downgrade(&self.shared),
+        );
+        self.shared
+            .tunnels
+            .write()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(target, outbound);
+        link
+    }
+}
+
+impl TunnelRegistration {
+    pub(super) fn new(
+        shared: Weak<Shared>,
+        target: SocketAddrV4,
+        sender: mpsc::Sender<Bytes>,
+    ) -> Self {
+        Self {
+            shared,
+            target,
+            sender,
+        }
     }
 }
 
@@ -339,6 +408,26 @@ impl UdpSender for RelaySender {
                             trace!("relay link is closed, dropping packet");
                             break;
                         }
+                    }
+                }
+                Poll::Ready(Ok(()))
+            }
+            PathAddr::Tunnel { target } => {
+                let tunnels = self
+                    .shared
+                    .tunnels
+                    .read()
+                    .unwrap_or_else(|err| err.into_inner());
+                let Some(tunnel) = tunnels.get(&target) else {
+                    return Poll::Ready(Ok(()));
+                };
+                let segment_size = transmit
+                    .segment_size
+                    .unwrap_or(transmit.contents.len())
+                    .max(1);
+                for segment in transmit.contents.chunks(segment_size) {
+                    if tunnel.try_send(Bytes::copy_from_slice(segment)).is_err() {
+                        trace!("tunnel queue full, dropping packet");
                     }
                 }
                 Poll::Ready(Ok(()))
