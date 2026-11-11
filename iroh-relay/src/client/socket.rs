@@ -7,7 +7,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicU16, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -35,6 +38,8 @@ struct Shared {
     links: RwLock<HashMap<RelayIndex, mpsc::Sender<Datagram>>>,
     /// Given to every link to deliver the packets it receives.
     inbound: mpsc::Sender<Inbound>,
+    /// The index the next link gets, if it is free.
+    next_index: AtomicU16,
 }
 
 impl fmt::Debug for Shared {
@@ -114,12 +119,20 @@ impl RelaySocket {
     ///
     /// `inner` is usually obtained from the QUIC stack's runtime, for example with
     /// `noq::Runtime::wrap_udp_socket`. It must be an IPv4 socket: relays hand out IPv4
-    /// addresses only.
-    pub fn new(inner: Box<dyn AsyncUdpSocket>) -> (Self, RelaySocketHandle) {
+    /// addresses only, and an IPv6 socket could receive from real addresses in the range
+    /// of the synthetic ones. Fails otherwise.
+    pub fn new(inner: Box<dyn AsyncUdpSocket>) -> io::Result<(Self, RelaySocketHandle)> {
+        if !inner.local_addr()?.is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the socket below a relay socket must be an IPv4 socket",
+            ));
+        }
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
         let shared = Arc::new(Shared {
             links: RwLock::new(HashMap::new()),
             inbound: inbound_tx,
+            next_index: AtomicU16::new(0),
         });
         let socket = Self {
             inner,
@@ -127,7 +140,7 @@ impl RelaySocket {
             shared: shared.clone(),
             relay_first: false,
         };
-        (socket, RelaySocketHandle { shared })
+        Ok((socket, RelaySocketHandle { shared }))
     }
 
     /// Receives packets that relays forwarded.
@@ -208,26 +221,35 @@ impl RelaySocketHandle {
     ///
     /// Must be called from within a tokio runtime.
     pub fn connect_relay(&self, dialer: WsDialer, credentials: Arc<dyn Credentials>) -> RelayLink {
-        let mut links = self.shared.links_mut();
-        // Indices are reused once their link is gone. There can not be more links than
-        // indices, a link holds a connection and a task.
-        let index = (0..=u16::MAX)
-            .map(RelayIndex)
-            .find(|index| !links.contains_key(index))
-            .expect("fewer than 65536 relay links");
+        let (outbound_tx, outbound_rx) = RelayLink::outbound_queue();
+        let index = {
+            let mut links = self.shared.links_mut();
+            // Indices count up, so that the index of a link that is gone is not handed
+            // out again soon: the QUIC stack may still hold paths that name it. There can
+            // not be more links than indices, a link holds a connection and a task.
+            let index = loop {
+                let index = RelayIndex(self.shared.next_index.fetch_add(1, Ordering::Relaxed));
+                if !links.contains_key(&index) {
+                    break index;
+                }
+            };
+            links.insert(index, outbound_tx);
+            index
+        };
+        // The lock is released: spawning can panic outside of a runtime, and dropping the
+        // registration takes the lock.
         let registration = Registration {
             shared: Arc::downgrade(&self.shared),
             index,
         };
-        let (link, outbound) = RelayLink::spawn(
+        RelayLink::spawn(
             index,
             dialer,
             credentials,
             self.shared.inbound.clone(),
+            outbound_rx,
             registration,
-        );
-        links.insert(index, outbound);
-        link
+        )
     }
 }
 
@@ -306,9 +328,17 @@ impl UdpSender for RelaySender {
                         remote,
                         payload: Bytes::copy_from_slice(segment),
                     };
-                    // A full queue is loss like any other.
-                    if link.try_send(datagram).is_err() {
-                        trace!("relay link queue full, dropping packet");
+                    match link.try_send(datagram) {
+                        Ok(()) => {}
+                        // A full queue is loss like any other.
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            trace!("relay link queue full, dropping packet");
+                        }
+                        // The link gave up or was closed.
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            trace!("relay link is closed, dropping packet");
+                            break;
+                        }
                     }
                 }
                 Poll::Ready(Ok(()))
@@ -316,6 +346,8 @@ impl UdpSender for RelaySender {
             // A synthetic address this version does not understand. There is nowhere to
             // send the packet.
             PathAddr::Direct(addr) if is_synthetic(&addr) => Poll::Ready(Ok(())),
+            // The real socket is an IPv4 socket and can not send to an IPv6 address.
+            PathAddr::Direct(SocketAddr::V6(_)) => Poll::Ready(Ok(())),
             PathAddr::Direct(addr) => {
                 // The real socket is an IPv4 socket and wants IPv4 addresses.
                 let transmit = Transmit {

@@ -29,6 +29,22 @@ const TOKEN: &str = "secret";
 const TIMEOUT: Duration = Duration::from_secs(10);
 const ALPN: &[u8] = b"relay-test";
 
+const BASE_PORT: u16 = 2_000;
+
+/// Returns a port range no other test relay uses.
+///
+/// The same identity prefers the same port on every relay with the same range, so relays
+/// that share a range take ports from one another. Tests can run in parallel in one
+/// process or in one process each, hence both a counter and the process id. The ranges
+/// lie below the ports operating systems pick for outgoing sockets.
+fn port_range() -> std::ops::RangeInclusive<u16> {
+    static NEXT_RANGE: AtomicU16 = AtomicU16::new(0);
+    let per_process = (std::process::id() % 20) as u16 * 500;
+    let per_test = NEXT_RANGE.fetch_add(1, Ordering::Relaxed) % 25 * 20;
+    let start = BASE_PORT + per_process + per_test;
+    start..=start + 19
+}
+
 async fn spawn_relay(release_timeout: Duration) -> Server {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut allocations = AllocationConfig::new(
@@ -37,10 +53,7 @@ async fn spawn_relay(release_timeout: Duration) -> Server {
         Arc::new(DefaultPolicy::default()),
     );
     allocations.release_timeout = release_timeout;
-    // Every relay gets its own ports, the tests run in parallel in one process.
-    static NEXT_RANGE: AtomicU16 = AtomicU16::new(0);
-    let start = 40_000 + 500 * NEXT_RANGE.fetch_add(1, Ordering::Relaxed);
-    allocations.ports = start..=start + 499;
+    allocations.ports = port_range();
     let mut relay = testing::relay_config();
     relay.allocations = Some(allocations);
     let mut config = ServerConfig::default();
@@ -94,7 +107,7 @@ fn bob(server_config: noq::ServerConfig) -> Bob {
     };
     let runtime = Arc::new(TokioRuntime);
     let inner = runtime.wrap_udp_socket(socket).unwrap();
-    let (socket, handle) = RelaySocket::new(inner);
+    let (socket, handle) = RelaySocket::new(inner).unwrap();
     let endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
         Some(server_config),
@@ -400,8 +413,31 @@ async fn dropping_the_link_releases_the_allocation() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // The index is free again, and a second link gets another one.
+    // The index is not handed out again right away: the QUIC stack may still hold paths
+    // that name it.
     let again = bob.connect_relay(&server, "bob");
-    assert_eq!(again.index(), index);
-    assert_ne!(bob.connect_relay(&server, "other").index(), index);
+    assert_ne!(again.index(), index);
+    timeout(TIMEOUT, again.public_addr())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Closing a link is visible in its state.
+    again.close();
+    let mut state = again.watch_state();
+    timeout(TIMEOUT, state.wait_for(|state| *state == LinkState::Closed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(again.public_addr().await.is_err());
+}
+
+#[tokio::test]
+async fn socket_requires_an_ipv4_socket() {
+    let Ok(socket) = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {
+        // No IPv6 on this machine.
+        return;
+    };
+    let inner = TokioRuntime.wrap_udp_socket(socket).unwrap();
+    assert!(RelaySocket::new(inner).is_err());
 }

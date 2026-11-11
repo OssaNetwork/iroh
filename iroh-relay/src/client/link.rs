@@ -10,7 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use n0_error::{e, stack_error};
-use n0_future::{Sink, SinkExt, Stream, StreamExt, task::AbortOnDropHandle, time};
+use n0_future::{Sink, SinkExt, Stream, StreamExt, time};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, trace, warn};
@@ -41,6 +41,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The delays between attempts to reconnect.
 const MIN_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// How long a control channel has to stay up for the delay to start over.
+///
+/// A relay that accepts a client and drops it right away would otherwise be dialed in a
+/// tight loop.
+const STABLE_AFTER: Duration = Duration::from_secs(10);
 
 /// How many packets wait for the control channel before packets are dropped.
 const OUTBOUND_QUEUE_DEPTH: usize = 512;
@@ -113,16 +119,22 @@ pub enum ControlError {
 impl ControlError {
     /// Returns whether trying again with the same credentials is pointless.
     fn is_permanent(&self) -> bool {
-        matches!(
-            self,
-            Self::Credentials { .. }
-                | Self::Encode { .. }
-                | Self::Refused {
-                    code: ErrorCode::Unauthorized | ErrorCode::Protocol,
-                    ..
-                }
-        )
+        match self {
+            Self::Credentials { .. } | Self::Encode { .. } => true,
+            Self::Refused { code, .. } => is_permanent(*code),
+            _ => false,
+        }
     }
+}
+
+/// Returns whether the relay will refuse again when the client connects again.
+fn is_permanent(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        // Reconnecting after being superseded would take the port back and forth between
+        // two users of the same identity.
+        ErrorCode::Unauthorized | ErrorCode::Protocol | ErrorCode::Superseded
+    )
 }
 
 /// An authenticated control channel to a relay.
@@ -264,6 +276,8 @@ pub enum LinkState {
     /// This happens when the relay rejects the credentials, or when another control
     /// channel with the same identity took over.
     Failed(String),
+    /// The link was closed with [`RelayLink::close`].
+    Closed,
 }
 
 impl LinkState {
@@ -289,16 +303,17 @@ pub(super) struct Inbound {
 /// [connected](LinkState::Connected) the relay forwards packets sent to the link's public
 /// address to the socket.
 ///
-/// Dropping the link closes the control channel. The relay then releases the public
-/// address after its release timeout.
+/// Dropping the link closes the control channel in the background. The relay then
+/// releases the public address after its release timeout.
 ///
 /// [`RelaySocketHandle::connect_relay`]: super::RelaySocketHandle::connect_relay
 #[derive(Debug)]
 pub struct RelayLink {
     index: RelayIndex,
     state: watch::Receiver<LinkState>,
+    /// Stops the task. The task is not aborted, so that it can close the control channel
+    /// properly.
     cancel: CancellationToken,
-    _task: AbortOnDropHandle<()>,
     /// Removes the link from the socket when dropped.
     _registration: Registration,
 }
@@ -309,9 +324,9 @@ impl RelayLink {
         dialer: WsDialer,
         credentials: Arc<dyn Credentials>,
         inbound: mpsc::Sender<Inbound>,
+        outbound: mpsc::Receiver<Datagram>,
         registration: Registration,
-    ) -> (Self, mpsc::Sender<Datagram>) {
-        let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_DEPTH);
+    ) -> Self {
         let (state_tx, state_rx) = watch::channel(LinkState::Connecting);
         let cancel = CancellationToken::new();
         let actor = Actor {
@@ -319,23 +334,26 @@ impl RelayLink {
             dialer,
             credentials,
             inbound,
-            outbound: outbound_rx,
+            outbound,
             state: state_tx,
             cancel: cancel.clone(),
         };
-        let task = n0_future::task::spawn(
+        n0_future::task::spawn(
             actor
                 .run()
                 .instrument(info_span!("relay-link", index = index.0)),
         );
-        let link = Self {
+        Self {
             index,
             state: state_rx,
             cancel,
-            _task: AbortOnDropHandle::new(task),
             _registration: registration,
-        };
-        (link, outbound_tx)
+        }
+    }
+
+    /// Creates the queue of packets for a link.
+    pub(super) fn outbound_queue() -> (mpsc::Sender<Datagram>, mpsc::Receiver<Datagram>) {
+        mpsc::channel(OUTBOUND_QUEUE_DEPTH)
     }
 
     /// Returns the index that identifies this relay in the addresses of the socket, see
@@ -356,7 +374,7 @@ impl RelayLink {
 
     /// Waits until the link is up and returns its public address.
     ///
-    /// Returns the reason if the link gave up.
+    /// Returns the reason if the link gave up or was closed.
     pub async fn public_addr(&self) -> Result<SocketAddrV4, String> {
         let mut state = self.state.clone();
         let res = state
@@ -365,11 +383,14 @@ impl RelayLink {
         match res.as_deref() {
             Ok(LinkState::Connected(addr)) => Ok(*addr),
             Ok(LinkState::Failed(reason)) => Err(reason.clone()),
-            Ok(LinkState::Connecting) | Err(_) => Err("the link was closed".to_string()),
+            Ok(LinkState::Connecting | LinkState::Closed) | Err(_) => {
+                Err("the link was closed".to_string())
+            }
         }
     }
 
-    /// Closes the control channel. The link does not reconnect.
+    /// Closes the control channel in the background. The link does not reconnect, and its
+    /// state becomes [`LinkState::Closed`].
     pub fn close(&self) {
         self.cancel.cancel();
     }
@@ -403,28 +424,35 @@ struct Actor {
 
 impl Actor {
     async fn run(mut self) {
+        let last = self.connect_and_serve().await;
+        // Whoever still looks at the link sees why it is over.
+        self.state.send_replace(last);
+    }
+
+    /// Keeps a control channel open until the link fails for good or is closed.
+    /// Returns the last state of the link.
+    async fn connect_and_serve(&mut self) -> LinkState {
         let mut backoff = MIN_BACKOFF;
         loop {
-            self.state.send_if_modified(|state| {
-                let changed = *state != LinkState::Connecting;
-                *state = LinkState::Connecting;
-                changed
-            });
             let connect = ControlClient::connect(&self.dialer, self.credentials.as_ref());
             let client = tokio::select! {
-                _ = self.cancel.cancelled() => return,
+                _ = self.cancel.cancelled() => return LinkState::Closed,
                 // Packets can not be sent while there is no control channel. Do not let
                 // them queue up to be sent late.
-                _ = discard(&mut self.outbound) => return,
+                _ = discard(&mut self.outbound) => return LinkState::Closed,
                 res = connect => res,
             };
             let ended = match client {
                 Ok(client) => {
                     debug!(addr = %client.public_addr(), "relay link connected");
-                    backoff = MIN_BACKOFF;
                     self.state
                         .send_replace(LinkState::Connected(client.public_addr()));
-                    self.serve(client).await
+                    let connected = time::Instant::now();
+                    let ended = self.serve(client).await;
+                    if connected.elapsed() >= STABLE_AFTER {
+                        backoff = MIN_BACKOFF;
+                    }
+                    ended
                 }
                 Err(err) if err.is_permanent() => Ended::Failed(err.to_string()),
                 Err(err) => {
@@ -433,11 +461,10 @@ impl Actor {
                 }
             };
             match ended {
-                Ended::Cancelled => return,
+                Ended::Cancelled => return LinkState::Closed,
                 Ended::Failed(reason) => {
                     warn!("relay link gave up: {reason}");
-                    self.state.send_replace(LinkState::Failed(reason));
-                    return;
+                    return LinkState::Failed(reason);
                 }
                 Ended::Broken(reason) => {
                     debug!(?backoff, "relay link broke: {reason}");
@@ -447,8 +474,8 @@ impl Actor {
             // Wait before the next attempt, a little longer every time it fails.
             let jitter = backoff.mul_f64(rand::random::<f64>() * 0.5);
             tokio::select! {
-                _ = self.cancel.cancelled() => return,
-                _ = discard(&mut self.outbound) => return,
+                _ = self.cancel.cancelled() => return LinkState::Closed,
+                _ = discard(&mut self.outbound) => return LinkState::Closed,
                 _ = time::sleep(backoff + jitter) => {}
             }
             backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -509,13 +536,11 @@ impl Actor {
                         }
                         RelayFrame::Control(RelayControl::Error { code, reason }) => {
                             return match code {
-                                // Somebody else uses our identity. Reconnecting would
-                                // take the port back and forth between the two.
                                 ErrorCode::Superseded => Ended::Failed(
                                     "another control channel with the same identity took over"
                                         .to_string(),
                                 ),
-                                ErrorCode::Unauthorized | ErrorCode::Protocol => {
+                                code if is_permanent(code) => {
                                     Ended::Failed(format!("the relay refused: {code:?} {reason}"))
                                 }
                                 _ => Ended::Broken("the relay reported an error"),

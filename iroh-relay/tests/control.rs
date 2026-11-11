@@ -30,6 +30,22 @@ use tokio::net::UdpSocket;
 const TOKEN: &str = "secret";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+const BASE_PORT: u16 = 12_000;
+
+/// Returns a port range no other test relay uses.
+///
+/// The same identity prefers the same port on every relay with the same range, so relays
+/// that share a range take ports from one another. Tests can run in parallel in one
+/// process or in one process each, hence both a counter and the process id. The ranges
+/// lie below the ports operating systems pick for outgoing sockets.
+fn port_range() -> std::ops::RangeInclusive<u16> {
+    static NEXT_RANGE: AtomicU16 = AtomicU16::new(0);
+    let per_process = (std::process::id() % 20) as u16 * 500;
+    let per_test = NEXT_RANGE.fetch_add(1, Ordering::Relaxed) % 25 * 20;
+    let start = BASE_PORT + per_process + per_test;
+    start..=start + 19
+}
+
 fn allocations(release_timeout: Duration) -> AllocationConfig {
     let mut config = AllocationConfig::new(
         Ipv4Addr::LOCALHOST,
@@ -37,11 +53,7 @@ fn allocations(release_timeout: Duration) -> AllocationConfig {
         Arc::new(ForwardAll),
     );
     config.release_timeout = release_timeout;
-    // Every relay gets its own ports. The tests run in parallel in one process, and the
-    // same identity prefers the same port on every relay with the same range.
-    static NEXT_RANGE: AtomicU16 = AtomicU16::new(0);
-    let start = 20_000 + 500 * NEXT_RANGE.fetch_add(1, Ordering::Relaxed);
-    config.ports = start..=start + 499;
+    config.ports = port_range();
     config
 }
 
