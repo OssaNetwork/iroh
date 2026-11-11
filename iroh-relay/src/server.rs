@@ -62,8 +62,8 @@ pub use self::{
     http_server::{Handlers, RelayService},
     metrics::{Metrics, RelayMetrics},
     policy::{
-        AllocationPolicy, DefaultPolicy, DefaultPolicyConfig, Direction, ForwardAll, Packet,
-        RateLimit, TrafficPolicy, Verdict,
+        AllocationPolicy, DefaultPolicy, DefaultPolicyConfig, Direction, ForwardAll,
+        InvalidPolicyConfig, Packet, RateLimit, TrafficPolicy, Verdict,
     },
     relay::{AllocationConfig, ControlConnection, InvalidConfig, Relay},
     resolver::{DEFAULT_CERT_RELOAD_INTERVAL, reloading_resolver},

@@ -87,7 +87,8 @@ The relay carries traffic for strangers in both directions, and limits both:
 # For how long after an address last sent to a client's port the client may
 # send to it. Defaults to 120.
 # reply_window_secs = 120
-# How many addresses are tracked per client. Defaults to 1024.
+# How many addresses are tracked per client. Defaults to 1024. When the table
+# is full a new address replaces the one that was silent the longest.
 # max_remotes = 1024
 # Whether the first packet from a new address must look like the start of a
 # QUIC connection. Defaults to true.
@@ -96,10 +97,15 @@ The relay carries traffic for strangers in both directions, and limits both:
 # inbound_bytes_per_second = 2097152
 # outbound_bytes_per_second = 2097152
 # How many bytes may pass at once after a quiet period. Default to one
-# second's worth.
+# second's worth. Values below 65536 are raised to 65536.
 # inbound_burst_bytes = 2097152
 # outbound_burst_bytes = 2097152
 ```
+
+Only packets from an address extend its reply window. A connection through
+the relay on which the dialer is silent for longer than the window is cut
+off, so the endpoints need a keep-alive interval, or an idle timeout, shorter
+than `reply_window_secs`.
 
 With `require_initial`, a dialer whose address changes in the middle of a
 connection, for example because its NAT rebinds, can not continue the

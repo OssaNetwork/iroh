@@ -372,6 +372,13 @@ impl AllocationShared {
                 self.metrics.packets_dropped_invalid.inc();
                 continue;
             }
+            // A packet for a client that is away is dropped before the policy sees it. It
+            // must not use up the client's rate limit, or count as contact with the
+            // sender.
+            if lock(&self.attached).is_none() {
+                self.metrics.packets_dropped_detached.inc();
+                continue;
+            }
             let remote = RemoteAddr::udp(from);
             if !self.allowed(Direction::Inbound, remote, &frame[DATAGRAM_HEADER_LEN..]) {
                 continue;

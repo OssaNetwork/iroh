@@ -5,6 +5,7 @@
 
 use std::{collections::HashMap, num::NonZeroU64, time::Duration};
 
+use n0_error::{ensure, stack_error};
 use n0_future::time::Instant;
 
 use super::ClientId;
@@ -97,9 +98,6 @@ const MIN_INITIAL_SIZE: usize = 1200;
 /// The smallest burst a rate limit allows, so that a packet of any forwarded size fits.
 const MIN_BURST_BYTES: u64 = 64 * 1024;
 
-/// How often the table of remote parties is searched for expired entries when it is full.
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
-
 /// A limit on the bytes forwarded for one allocation in one direction.
 ///
 /// This is a token bucket. Packets that exceed the limit are dropped, which the QUIC
@@ -134,17 +132,26 @@ pub struct DefaultPolicyConfig {
     ///
     /// A client can only send to remote parties that recently sent to its port. This
     /// keeps the client from using the relay as a general UDP proxy.
+    ///
+    /// Only packets from the remote party extend the window. A connection through the
+    /// relay on which the remote party is silent for longer than this is cut off, so the
+    /// endpoints need a keep-alive interval, or an idle timeout, shorter than the window.
+    /// Must not be zero.
     pub reply_window: Duration,
     /// How many remote parties are tracked per allocation. Defaults to
     /// [`DEFAULT_MAX_REMOTES`].
     ///
-    /// Packets of further remote parties are dropped until tracked ones expire.
+    /// When the table is full a new remote party replaces the one that was silent the
+    /// longest, preferring those the client never answered. A flood of packets from
+    /// spoofed addresses can therefore not keep new dialers out, but it can push out
+    /// remote parties that have been quiet for a moment. Must not be zero.
     pub max_remotes: usize,
     /// Whether the first packet of a remote party must look like the start of a QUIC
     /// connection: a long header packet of at least 1200 bytes. Defaults to `true`.
     ///
-    /// This makes it more expensive to flood the allocation from spoofed addresses. The
-    /// price is that a dialer whose address changes mid-connection, for example because
+    /// This makes it more expensive to flood the allocation from spoofed addresses: every
+    /// packet has to be large. It does not stop a flood, the relay can not tell a real
+    /// Initial from a made up one. The price is that a dialer whose address changes mid-connection, for example because
     /// its NAT rebinds, can not continue the connection through the relay: the first
     /// packet from its new address is not an Initial. The connection then times out and
     /// the dialer has to connect again.
@@ -182,10 +189,26 @@ pub struct DefaultPolicy {
     config: DefaultPolicyConfig,
 }
 
+/// The configuration of a [`DefaultPolicy`] is not usable.
+#[stack_error(derive, add_meta)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum InvalidPolicyConfig {
+    #[error("reply_window must not be zero")]
+    ZeroReplyWindow,
+    #[error("max_remotes must not be zero")]
+    ZeroMaxRemotes,
+}
+
 impl DefaultPolicy {
     /// Creates the policy.
-    pub fn new(config: DefaultPolicyConfig) -> Self {
-        Self { config }
+    pub fn new(config: DefaultPolicyConfig) -> Result<Self, InvalidPolicyConfig> {
+        ensure!(
+            !config.reply_window.is_zero(),
+            InvalidPolicyConfig::ZeroReplyWindow
+        );
+        ensure!(config.max_remotes > 0, InvalidPolicyConfig::ZeroMaxRemotes);
+        Ok(Self { config })
     }
 }
 
@@ -193,7 +216,6 @@ impl TrafficPolicy for DefaultPolicy {
     fn allocation(&self, _identity: &ClientId) -> Box<dyn AllocationPolicy> {
         Box::new(DefaultAllocationPolicy {
             remotes: HashMap::new(),
-            last_cleanup: None,
             inbound: self.config.inbound.map(TokenBucket::new),
             outbound: self.config.outbound.map(TokenBucket::new),
             config: self.config.clone(),
@@ -201,13 +223,19 @@ impl TrafficPolicy for DefaultPolicy {
     }
 }
 
+/// What the policy remembers about a remote party.
+#[derive(Debug, Clone, Copy)]
+struct Remote {
+    /// When the remote party last sent to the allocation.
+    seen: Instant,
+    /// Whether the client ever sent to the remote party.
+    answered: bool,
+}
+
 #[derive(Debug)]
 struct DefaultAllocationPolicy {
     config: DefaultPolicyConfig,
-    /// The remote parties and when each last sent to the allocation.
-    remotes: HashMap<RemoteAddr, Instant>,
-    /// When expired remote parties were last removed because the table was full.
-    last_cleanup: Option<Instant>,
+    remotes: HashMap<RemoteAddr, Remote>,
     inbound: Option<TokenBucket>,
     outbound: Option<TokenBucket>,
 }
@@ -215,47 +243,57 @@ struct DefaultAllocationPolicy {
 impl DefaultAllocationPolicy {
     /// Returns whether `remote` sent to the allocation within the reply window.
     fn is_recent(&self, remote: &RemoteAddr, now: Instant) -> bool {
-        self.remotes
-            .get(remote)
-            .is_some_and(|seen| now.saturating_duration_since(*seen) <= self.config.reply_window)
+        self.remotes.get(remote).is_some_and(|remote| {
+            now.saturating_duration_since(remote.seen) <= self.config.reply_window
+        })
     }
 
-    /// Makes room for a new remote party, returns whether there is room.
-    fn make_room(&mut self, now: Instant) -> bool {
+    /// Makes room for one more remote party if the table is full.
+    ///
+    /// Removes the remote party that was silent the longest, preferring those the client
+    /// never answered: a remote party that only ever sent, such as a spoofed address in a
+    /// flood, goes before one the client is talking to.
+    fn make_room(&mut self) {
         if self.remotes.len() < self.config.max_remotes {
-            return true;
+            return;
         }
-        // Searching the table costs time proportional to its size. Do not let a flood of
-        // new remote parties trigger it for every packet.
-        if self
-            .last_cleanup
-            .is_some_and(|last| now.saturating_duration_since(last) < CLEANUP_INTERVAL)
-        {
-            return false;
+        let victim = self
+            .remotes
+            .iter()
+            .min_by_key(|(_, remote)| (remote.answered, remote.seen))
+            .map(|(addr, _)| *addr);
+        if let Some(victim) = victim {
+            self.remotes.remove(&victim);
         }
-        self.last_cleanup = Some(now);
-        let window = self.config.reply_window;
-        self.remotes
-            .retain(|_, seen| now.saturating_duration_since(*seen) <= window);
-        self.remotes.len() < self.config.max_remotes
     }
 
     fn check_inbound(&mut self, packet: &Packet<'_>) -> Verdict {
         let known = self.is_recent(&packet.remote, packet.now);
-        if !known {
-            if self.config.require_initial && !looks_like_initial(packet.payload) {
-                return Verdict::Drop;
-            }
-            if !self.make_room(packet.now) {
-                return Verdict::Drop;
-            }
+        if !known && self.config.require_initial && !looks_like_initial(packet.payload) {
+            return Verdict::Drop;
         }
+        // The rate limit comes before the table of remote parties is touched. It bounds
+        // how often a flood of new remote parties can make the table search for room.
         if let Some(bucket) = &mut self.inbound
             && !bucket.take(packet.payload.len(), packet.now)
         {
             return Verdict::Drop;
         }
-        self.remotes.insert(packet.remote, packet.now);
+        match self.remotes.get_mut(&packet.remote) {
+            // Also a remote party whose window has passed: it starts over, but what the
+            // client did before still counts.
+            Some(remote) => remote.seen = packet.now,
+            None => {
+                self.make_room();
+                self.remotes.insert(
+                    packet.remote,
+                    Remote {
+                        seen: packet.now,
+                        answered: false,
+                    },
+                );
+            }
+        }
         Verdict::Forward
     }
 
@@ -267,6 +305,9 @@ impl DefaultAllocationPolicy {
             && !bucket.take(packet.payload.len(), packet.now)
         {
             return Verdict::Drop;
+        }
+        if let Some(remote) = self.remotes.get_mut(&packet.remote) {
+            remote.answered = true;
         }
         Verdict::Forward
     }
@@ -286,7 +327,8 @@ impl AllocationPolicy for DefaultAllocationPolicy {
 /// That is an Initial packet in a datagram of at least 1200 bytes. The packet type is
 /// only checked for the QUIC versions whose encoding is known here. A long header packet
 /// of another version passes, the client then answers it with a Version Negotiation
-/// packet.
+/// packet. Version 0 marks a Version Negotiation packet itself, which never starts a
+/// connection.
 fn looks_like_initial(payload: &[u8]) -> bool {
     const QUIC_V1: u32 = 0x0000_0001;
     const QUIC_V2: u32 = 0x6b33_43cf;
@@ -305,25 +347,32 @@ fn looks_like_initial(payload: &[u8]) -> bool {
         QUIC_V1 => packet_type == 0b00,
         // RFC 9369 section 3.2
         QUIC_V2 => packet_type == 0b01,
+        0 => false,
         _ => true,
     }
 }
 
 /// A token bucket that takes the time as an argument.
+///
+/// Tokens are counted in units of a billionth of a byte. Refilling is then exact for
+/// every rate: a nanosecond adds `bytes_per_second` units.
 #[derive(Debug)]
 struct TokenBucket {
-    bytes_per_second: u64,
-    burst: u64,
-    tokens: u64,
+    bytes_per_second: u128,
+    burst: u128,
+    tokens: u128,
     /// The time up to which tokens were added.
     refilled: Option<Instant>,
 }
 
+/// How many token units a byte costs.
+const UNITS_PER_BYTE: u128 = 1_000_000_000;
+
 impl TokenBucket {
     fn new(limit: RateLimit) -> Self {
-        let burst = limit.burst_bytes.max(MIN_BURST_BYTES);
+        let burst = u128::from(limit.burst_bytes.max(MIN_BURST_BYTES)) * UNITS_PER_BYTE;
         Self {
-            bytes_per_second: limit.bytes_per_second.get(),
+            bytes_per_second: u128::from(limit.bytes_per_second.get()),
             burst,
             tokens: burst,
             refilled: None,
@@ -333,29 +382,19 @@ impl TokenBucket {
     /// Takes `bytes` tokens, returns whether there were enough.
     fn take(&mut self, bytes: usize, now: Instant) -> bool {
         if let Some(refilled) = self.refilled {
-            let elapsed = now.saturating_duration_since(refilled);
-            let added = (elapsed.as_nanos() * u128::from(self.bytes_per_second) / 1_000_000_000)
-                .min(u128::from(self.burst)) as u64;
-            if added > 0 {
-                self.tokens = self.tokens.saturating_add(added).min(self.burst);
-                // Only advance by the time the added tokens account for, so that the
-                // remainder is not lost to rounding.
-                let consumed = Duration::from_nanos(
-                    (u128::from(added) * 1_000_000_000 / u128::from(self.bytes_per_second))
-                        .min(u128::from(u64::MAX)) as u64,
-                );
-                self.refilled = Some(if self.tokens == self.burst {
-                    now
-                } else {
-                    refilled + consumed
-                });
-            }
-        } else {
+            let elapsed = now.saturating_duration_since(refilled).as_nanos();
+            self.tokens = self
+                .tokens
+                .saturating_add(elapsed.saturating_mul(self.bytes_per_second))
+                .min(self.burst);
+        }
+        // Time never moves backwards here, `saturating_duration_since` saw to that.
+        if self.refilled.is_none_or(|refilled| now > refilled) {
             self.refilled = Some(now);
         }
-        let bytes = bytes as u64;
-        if self.tokens >= bytes {
-            self.tokens -= bytes;
+        let cost = bytes as u128 * UNITS_PER_BYTE;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -381,7 +420,9 @@ mod tests {
     }
 
     fn policy(config: DefaultPolicyConfig) -> Box<dyn AllocationPolicy> {
-        DefaultPolicy::new(config).allocation(&ClientId::new("bob"))
+        DefaultPolicy::new(config)
+            .unwrap()
+            .allocation(&ClientId::new("bob"))
     }
 
     fn check(
@@ -438,6 +479,11 @@ mod tests {
         packet[1..5].copy_from_slice(&0x0a0a_0a0au32.to_be_bytes());
         packet[0] = 0xf0;
         assert!(looks_like_initial(&packet));
+
+        // A Version Negotiation packet does not start a connection.
+        let mut packet = initial();
+        packet[1..5].copy_from_slice(&[0; 4]);
+        assert!(!looks_like_initial(&packet));
     }
 
     #[test]
@@ -529,61 +575,94 @@ mod tests {
     }
 
     #[test]
-    fn bounds_the_number_of_remote_parties() {
+    fn full_table_replaces_the_quietest_remote_party() {
         let now = Instant::now();
         let mut config = unlimited();
-        config.max_remotes = 2;
+        config.max_remotes = 3;
+        let mut policy = policy(config);
+        let at = |secs| now + Duration::from_secs(secs);
+        let inbound = |policy: &mut Box<dyn AllocationPolicy>, n, secs| {
+            check(policy, Direction::Inbound, remote(n), &initial(), at(secs))
+        };
+        let outbound = |policy: &mut Box<dyn AllocationPolicy>, n, secs| {
+            check(policy, Direction::Outbound, remote(n), b"hi", at(secs))
+        };
+
+        // Three remote parties. The client answers the first, which is also the oldest.
+        for n in 1..=3 {
+            assert_eq!(inbound(&mut policy, n, u64::from(n)), Verdict::Forward);
+        }
+        assert_eq!(outbound(&mut policy, 1, 3), Verdict::Forward);
+
+        // A fourth one is not kept out. It replaces the quietest one that was never
+        // answered, which is the second.
+        assert_eq!(inbound(&mut policy, 4, 4), Verdict::Forward);
+        assert_eq!(outbound(&mut policy, 2, 4), Verdict::Drop);
+        assert_eq!(outbound(&mut policy, 1, 4), Verdict::Forward);
+        assert_eq!(outbound(&mut policy, 3, 4), Verdict::Forward);
+        assert_eq!(outbound(&mut policy, 4, 4), Verdict::Forward);
+
+        // Now all were answered. The next one replaces the quietest of them.
+        assert_eq!(inbound(&mut policy, 5, 5), Verdict::Forward);
+        assert_eq!(outbound(&mut policy, 1, 5), Verdict::Drop);
+        assert_eq!(outbound(&mut policy, 3, 5), Verdict::Forward);
+    }
+
+    #[test]
+    fn flood_does_not_keep_dialers_out() {
+        let now = Instant::now();
+        let mut config = unlimited();
+        config.max_remotes = 8;
         let mut policy = policy(config);
 
-        for n in 1..=2 {
+        // A flood from spoofed addresses fills the table many times over.
+        for n in 0..1000u16 {
             assert_eq!(
-                check(&mut policy, Direction::Inbound, remote(n), &initial(), now),
+                check(
+                    &mut policy,
+                    Direction::Inbound,
+                    remote(1000 + n),
+                    &initial(),
+                    now
+                ),
                 Verdict::Forward
             );
+            // A dialer that shows up in the middle of it gets in and stays in, since the
+            // client answers it.
+            if n == 500 {
+                assert_eq!(
+                    check(&mut policy, Direction::Inbound, remote(1), &initial(), now),
+                    Verdict::Forward
+                );
+                assert_eq!(
+                    check(&mut policy, Direction::Outbound, remote(1), b"hi", now),
+                    Verdict::Forward
+                );
+            }
         }
         assert_eq!(
-            check(&mut policy, Direction::Inbound, remote(3), &initial(), now),
-            Verdict::Drop
-        );
-        // Known remote parties are not affected.
-        assert_eq!(
-            check(&mut policy, Direction::Inbound, remote(1), b"more", now),
+            check(&mut policy, Direction::Outbound, remote(1), b"hi", now),
             Verdict::Forward
         );
+        assert_eq!(
+            check(&mut policy, Direction::Inbound, remote(2), &initial(), now),
+            Verdict::Forward
+        );
+    }
 
-        // Expired remote parties make room for new ones.
-        let later = now + DEFAULT_REPLY_WINDOW + Duration::from_secs(2);
-        assert_eq!(
-            check(
-                &mut policy,
-                Direction::Inbound,
-                remote(3),
-                &initial(),
-                later
-            ),
-            Verdict::Forward
-        );
-        assert_eq!(
-            check(
-                &mut policy,
-                Direction::Inbound,
-                remote(4),
-                &initial(),
-                later
-            ),
-            Verdict::Forward
-        );
-        // The table is full again and was searched just now.
-        assert_eq!(
-            check(
-                &mut policy,
-                Direction::Inbound,
-                remote(5),
-                &initial(),
-                later
-            ),
-            Verdict::Drop
-        );
+    #[test]
+    fn rejects_unusable_config() {
+        let config = DefaultPolicyConfig {
+            max_remotes: 0,
+            ..Default::default()
+        };
+        assert!(DefaultPolicy::new(config).is_err());
+        let config = DefaultPolicyConfig {
+            reply_window: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(DefaultPolicy::new(config).is_err());
+        assert!(DefaultPolicy::new(DefaultPolicyConfig::default()).is_ok());
     }
 
     #[test]
@@ -646,5 +725,26 @@ mod tests {
             passed.abs_diff(expected) <= 2000,
             "passed {passed} bytes, expected about {expected}"
         );
+    }
+
+    #[test]
+    fn token_bucket_is_exact_for_very_high_rates() {
+        let start = Instant::now();
+        let rate = 1_500_000_000u64;
+        let mut bucket = TokenBucket::new(RateLimit {
+            bytes_per_second: NonZeroU64::new(rate).unwrap(),
+            burst_bytes: MIN_BURST_BYTES,
+        });
+        // Empty the bucket, then ask for a byte every nanosecond. At this rate one and a
+        // half bytes arrive per nanosecond, so every request is granted, and asking for
+        // two bytes every nanosecond is granted three times out of four.
+        assert!(bucket.take(MIN_BURST_BYTES as usize, start));
+        let mut granted = 0;
+        for ns in 1..=1000u64 {
+            if bucket.take(2, start + Duration::from_nanos(ns)) {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 750);
     }
 }

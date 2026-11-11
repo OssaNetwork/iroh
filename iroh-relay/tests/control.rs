@@ -527,6 +527,43 @@ async fn channel_binding_matches_on_both_ends() {
 }
 
 #[tokio::test]
+async fn policy_does_not_see_packets_for_an_absent_client() {
+    let mut config = allocations(Duration::from_secs(30));
+    config.policy = Arc::new(DefaultPolicy::default());
+    let server = spawn_relay(config).await;
+    let (bob, bob_addr) = connect(&server, "bob").await;
+    let (alice, _) = udp_socket().await;
+    let metrics = server.metrics();
+
+    // While Bob is away his packets are dropped before the policy sees them.
+    drop(bob);
+    let detached = || metrics.server.packets_dropped_detached.get();
+    let send_until = |count: u64| {
+        let alice = &alice;
+        async move {
+            let deadline = tokio::time::Instant::now() + TIMEOUT;
+            while detached() < count {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "packets not dropped"
+                );
+                alice.send_to(b"not quic", bob_addr).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    // The relay takes a moment to notice that Bob left. Until then the policy drops the
+    // packets, since they are not QUIC.
+    send_until(1).await;
+    let dropped_by_policy = metrics.server.packets_dropped_policy.get();
+    send_until(detached() + 5).await;
+    assert_eq!(
+        metrics.server.packets_dropped_policy.get(),
+        dropped_by_policy
+    );
+}
+
+#[tokio::test]
 async fn default_policy_only_lets_the_client_reply() {
     let mut config = allocations(Duration::from_secs(30));
     config.policy = Arc::new(DefaultPolicy::default());

@@ -189,9 +189,12 @@ struct AllocationsConfig {
 #[serde(deny_unknown_fields)]
 struct PolicyConfig {
     /// For how many seconds after a remote party last sent to a client's port the client
-    /// may send to it. Defaults to 120.
+    /// may send to it. Defaults to 120. Must not be 0.
+    ///
+    /// Connections through the relay need a keep-alive interval, or an idle timeout,
+    /// shorter than this.
     reply_window_secs: Option<u64>,
-    /// How many remote parties are tracked per client. Defaults to 1024.
+    /// How many remote parties are tracked per client. Defaults to 1024. Must not be 0.
     max_remotes: Option<usize>,
     /// Whether the first packet of a remote party must look like the start of a QUIC
     /// connection. Defaults to `true`.
@@ -200,13 +203,13 @@ struct PolicyConfig {
     /// With 0 the rate is not limited.
     inbound_bytes_per_second: Option<u64>,
     /// How many bytes may be forwarded to a client at once after a quiet period.
-    /// Defaults to one second's worth.
+    /// Defaults to one second's worth. Values below 65536 are raised to 65536.
     inbound_burst_bytes: Option<u64>,
     /// The limit on bytes per second forwarded from a client. Defaults to 2097152
     /// (2 MiB). With 0 the rate is not limited.
     outbound_bytes_per_second: Option<u64>,
     /// How many bytes may be forwarded from a client at once after a quiet period.
-    /// Defaults to one second's worth.
+    /// Defaults to one second's worth. Values below 65536 are raised to 65536.
     outbound_burst_bytes: Option<u64>,
 }
 
@@ -241,9 +244,6 @@ impl PolicyConfig {
             config.reply_window = Duration::from_secs(secs);
         }
         if let Some(max_remotes) = self.max_remotes {
-            if max_remotes == 0 {
-                bail_any!("allocations.policy: max_remotes must not be 0");
-            }
             config.max_remotes = max_remotes;
         }
         if let Some(require_initial) = self.require_initial {
@@ -290,7 +290,8 @@ impl AllocationsConfig {
             bail_any!("allocations: invalid max_packet_size {max_packet_size}");
         }
 
-        let policy = relay::DefaultPolicy::new(self.policy.into_policy_config()?);
+        let policy = relay::DefaultPolicy::new(self.policy.into_policy_config()?)
+            .std_context("allocations.policy")?;
         let mut config = relay::AllocationConfig::new(
             self.public_ip,
             Arc::new(relay::SharedTokenAuthenticator::new(tokens)),
@@ -801,7 +802,19 @@ mod tests {
         assert_eq!(inbound.burst_bytes, 500_000);
         assert_eq!(config.outbound, None);
 
-        assert!(parse("[allocations.policy]\nmax_remotes = 0").is_err());
+        // Checked when the policy is built.
+        let build = |policy: &str| -> Result<relay::AllocationConfig> {
+            let config = Config::from_str(&format!(
+                "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"t\"]\n{policy}"
+            ))?;
+            config
+                .allocations
+                .expect("allocations")
+                .into_allocation_config()
+        };
+        assert!(build("").is_ok());
+        assert!(build("[allocations.policy]\nmax_remotes = 0").is_err());
+        assert!(build("[allocations.policy]\nreply_window_secs = 0").is_err());
         assert!(
             parse("[allocations.policy]\noutbound_bytes_per_second = 0\noutbound_burst_bytes = 9")
                 .is_err()
