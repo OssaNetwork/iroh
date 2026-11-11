@@ -594,3 +594,209 @@ async fn connection_adds_a_direct_path_next_to_the_relayed_one() {
     echo(&alice_conn, &large).await;
     echo(&alice_conn, b"without the relay").await;
 }
+
+/// Forwards UDP packets between Bob's socket and whoever else sends to it, until it is
+/// stopped. Stands in for a direct path that can be made to fail.
+async fn forward_until_stopped(
+    socket: tokio::net::UdpSocket,
+    bob: SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut other = None;
+    let mut buf = vec![0u8; 65_535];
+    loop {
+        let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+            return;
+        };
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        let to = if from == bob {
+            other
+        } else {
+            other = Some(from);
+            Some(bob)
+        };
+        if let Some(to) = to {
+            let _ = socket.send_to(&buf[..len], to).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn connection_falls_back_to_the_relayed_path_kept_as_a_backup() {
+    use n0_future::StreamExt;
+    use noq::{PathEvent, PathId, PathStatus};
+
+    let server = spawn_relay(Duration::from_secs(30)).await;
+    let (mut server_config, mut client_config) = quic_configs();
+    server_config.transport_config(traversal_transport());
+    client_config.transport_config(traversal_transport());
+
+    let bob = bob(server_config);
+    let _link = bob.connect_relay(&server, "bob");
+    let public_addr = timeout(TIMEOUT, _link.public_addr())
+        .await
+        .unwrap()
+        .unwrap();
+    let alice = relay_endpoint(None);
+    alice.endpoint.set_default_client_config(client_config);
+
+    // The direct path runs through a forwarder, so that the test can break it.
+    let forwarder = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let SocketAddr::V4(forwarder_addr) = forwarder.local_addr().unwrap() else {
+        panic!("not an IPv4 socket");
+    };
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn(forward_until_stopped(
+        forwarder,
+        bob.local_addr.into(),
+        stop.clone(),
+    ));
+
+    let (alice_conn, bob_conn) = tokio::join!(
+        async {
+            alice
+                .endpoint
+                .connect(public_addr.into(), "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        bob.serve_one()
+    );
+    echo(&alice_conn, b"through the relay").await;
+
+    // Each end looks after the paths as they come up. A direct path that died has to be
+    // noticed, at both ends: an end that keeps a dead path as its preferred one sends
+    // into the void. So direct paths get a keep-alive and a short idle timeout.
+    let look_after = |path: &noq::Path| {
+        let _ = path.set_keep_alive_interval(Some(Duration::from_millis(500)));
+        let _ = path.set_max_idle_timeout(Some(Duration::from_secs(2)));
+    };
+    // Bob, who knows which path goes through the relay, makes it the backup and keeps
+    // it from going idle. He prefers every direct path.
+    let mut bob_paths = bob_conn.path_events();
+    tokio::spawn({
+        let bob_conn = bob_conn.clone();
+        async move {
+            while let Some(event) = bob_paths.next().await {
+                if let Ok(PathEvent::Established { id, .. }) = event
+                    && id != PathId::ZERO
+                    && let Some(path) = bob_conn.path(id)
+                {
+                    look_after(&path);
+                    // The status is only sent to the other end when it changes.
+                    let _ = path.set_status(PathStatus::Backup);
+                    let _ = path.set_status(PathStatus::Available);
+                    if let Some(first) = bob_conn.path(PathId::ZERO) {
+                        let _ = first.set_keep_alive_interval(Some(Duration::from_secs(1)));
+                        let _ = first.set_status(PathStatus::Backup);
+                    }
+                }
+            }
+        }
+    });
+    // The dialer can not tell the paths apart. She follows what Bob says about them.
+    let mut alice_paths = alice_conn.path_events();
+    tokio::spawn({
+        let alice_conn = alice_conn.clone();
+        async move {
+            while let Some(event) = alice_paths.next().await {
+                match event {
+                    Ok(PathEvent::Established { id, .. }) if id != PathId::ZERO => {
+                        if let Some(path) = alice_conn.path(id) {
+                            look_after(&path);
+                        }
+                    }
+                    Ok(PathEvent::RemoteStatus { id, status, .. }) => {
+                        if let Some(path) = alice_conn.path(id) {
+                            let _ = path.set_status(status);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    // Bob says where he can be reached directly. A round needs an address of the
+    // dialer too. Hers leads nowhere, so that the forwarder is the only way.
+    let nowhere = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let SocketAddr::V4(nowhere_addr) = nowhere.local_addr().unwrap() else {
+        panic!("not an IPv4 socket");
+    };
+    let direct = |addr: SocketAddrV4| PathAddr::Direct(addr.into()).to_socket_addr();
+    bob_conn
+        .add_nat_traversal_address(direct(forwarder_addr))
+        .unwrap();
+    alice_conn
+        .add_nat_traversal_address(direct(nowhere_addr))
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while alice_conn
+        .get_remote_nat_traversal_addresses()
+        .unwrap()
+        .is_empty()
+    {
+        assert!(tokio::time::Instant::now() < deadline, "not advertised");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    alice_conn.initiate_nat_traversal_round().unwrap();
+
+    // The direct path comes up and becomes the preferred one at both ends.
+    let alice_first = alice_conn.path(PathId::ZERO).unwrap();
+    let statuses = |conn: &noq::Connection| -> Vec<(PathAddr, PathStatus)> {
+        (1..16u32)
+            .filter_map(|id| conn.path(PathId::from(id)))
+            .filter_map(|path| Some((path.remote_address().ok()?, path.status().ok()?)))
+            .map(|(remote, status)| (PathAddr::from_socket_addr(remote), status))
+            .collect()
+    };
+    let through_forwarder = vec![(
+        PathAddr::Direct(forwarder_addr.into()),
+        PathStatus::Available,
+    )];
+    timeout(TIMEOUT, async {
+        loop {
+            if alice_first.status() == Ok(PathStatus::Backup)
+                && statuses(&alice_conn) == through_forwarder
+                && statuses(&bob_conn) == through_forwarder
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the direct path did not become the preferred one: {:?} {:?} {:?}",
+            alice_first.status(),
+            statuses(&alice_conn),
+            statuses(&bob_conn)
+        )
+    });
+
+    let through_relay = || {
+        let metrics = &server.metrics().server;
+        metrics.packets_inbound.get() + metrics.packets_outbound.get()
+    };
+    let before = through_relay();
+    let large: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+    echo(&alice_conn, &large).await;
+    let delta = through_relay() - before;
+    assert!(delta < 20, "{delta} packets still went through the relay");
+
+    // The direct path dies. The connection carries on through the relay.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let before = through_relay();
+    echo(&alice_conn, &large).await;
+    let delta = through_relay() - before;
+    assert!(delta > 100, "only {delta} packets went through the relay");
+    echo(&alice_conn, b"still here").await;
+    assert_eq!(alice_first.status(), Ok(PathStatus::Backup));
+    assert_eq!(statuses(&alice_conn), vec![]);
+}
