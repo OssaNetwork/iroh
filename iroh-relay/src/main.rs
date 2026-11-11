@@ -189,6 +189,45 @@ struct AllocationsConfig {
     /// Which packets are forwarded. The defaults apply if not present.
     #[serde(default)]
     policy: PolicyConfig,
+    /// The mainline DHT service for clients. Not offered if not present.
+    ///
+    /// Needs a binary built with the `dht` feature.
+    dht: Option<DhtServiceConfig>,
+}
+
+/// Configuration of the mainline DHT service.
+///
+/// The relay runs one DHT node. On request of a client it announces the client's public
+/// address for an infohash and keeps the announcement fresh, and looks up the peers of an
+/// infohash. The relay learns every infohash its clients announce or look up.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DhtServiceConfig {
+    /// The UDP port of the relay's DHT node. Chosen by the operating system if not set.
+    ///
+    /// The port has to be reachable from the internet for the node to take part fully.
+    port: Option<u16>,
+    /// The nodes to join the DHT through, as `host:port`. Defaults to the well known
+    /// nodes of the mainline DHT.
+    bootstrap: Option<Vec<String>>,
+    /// How often the announcements of clients are refreshed, in seconds. Defaults to 900.
+    refresh_interval_secs: Option<u64>,
+}
+
+impl DhtServiceConfig {
+    #[cfg(feature = "dht")]
+    fn into_dht_config(self) -> Result<relay::dht::DhtConfig> {
+        let mut config = relay::dht::DhtConfig::default();
+        config.port = self.port;
+        config.bootstrap = self.bootstrap;
+        if let Some(secs) = self.refresh_interval_secs {
+            if secs == 0 {
+                bail_any!("allocations.dht: refresh_interval_secs must not be 0");
+            }
+            config.refresh_interval = Duration::from_secs(secs);
+        }
+        Ok(config)
+    }
 }
 
 /// Configuration of which packets are forwarded for a client.
@@ -313,6 +352,17 @@ impl AllocationsConfig {
         config.max_packet_size = max_packet_size;
         if let Some(max_tunnels) = self.max_tunnels {
             config.max_tunnels = max_tunnels;
+        }
+        #[cfg(feature = "dht")]
+        {
+            config.dht = self
+                .dht
+                .map(DhtServiceConfig::into_dht_config)
+                .transpose()?;
+        }
+        #[cfg(not(feature = "dht"))]
+        if self.dht.is_some() {
+            bail_any!("allocations.dht is set, but this binary is built without the `dht` feature");
         }
         Ok(config)
     }
@@ -778,6 +828,46 @@ mod tests {
                 "config must be rejected: {invalid}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_dht_config() -> Result {
+        let build = |dht: &str| -> Result<relay::AllocationConfig> {
+            let config = Config::from_str(&format!(
+                "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"t\"]\n{dht}"
+            ))?;
+            config
+                .allocations
+                .expect("allocations")
+                .into_allocation_config()
+        };
+        let with_dht = r#"
+            [allocations.dht]
+            port = 6881
+            bootstrap = ["router.example:6881"]
+            refresh_interval_secs = 600
+        "#;
+        #[cfg(feature = "dht")]
+        {
+            assert!(build("")?.dht.is_none());
+            let dht = build(with_dht)?.dht.expect("dht");
+            assert_eq!(dht.port, Some(6881));
+            assert_eq!(dht.bootstrap, Some(vec!["router.example:6881".to_string()]));
+            assert_eq!(dht.refresh_interval, Duration::from_secs(600));
+            let dht = build("[allocations.dht]")?.dht.expect("dht");
+            assert_eq!(dht.port, None);
+            assert_eq!(dht.bootstrap, None);
+            assert_eq!(dht.refresh_interval, Duration::from_secs(900));
+            assert!(build("[allocations.dht]\nrefresh_interval_secs = 0").is_err());
+        }
+        #[cfg(not(feature = "dht"))]
+        {
+            assert!(build("").is_ok());
+            // Asking for a service the binary does not have is an error, not ignored.
+            assert!(build(with_dht).is_err());
+        }
+        assert!(build("[allocations.dht]\nunknown = 1").is_err());
         Ok(())
     }
 

@@ -40,6 +40,15 @@ pub struct Metrics {
     /// Number of tunnels closed to make room for a newer one.
     pub tunnels_evicted: Counter,
 
+    /// Number of announcements sent to the mainline DHT for clients, including refreshes.
+    pub dht_announces: Counter,
+    /// Number of announcements to the mainline DHT that failed.
+    pub dht_announces_failed: Counter,
+    /// Number of lookups on the mainline DHT started for clients.
+    pub dht_lookups: Counter,
+    /// Number of DHT requests of clients that were refused.
+    pub dht_requests_denied: Counter,
+
     /*
      * Metrics about packets
      */

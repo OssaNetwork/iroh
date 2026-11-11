@@ -346,6 +346,7 @@ mod control_type {
     pub(super) const DHT_FIND_PEERS: u8 = 8;
     pub(super) const DHT_PEERS: u8 = 9;
     pub(super) const DHT_FIND_PEERS_DONE: u8 = 10;
+    pub(super) const DHT_STOPPED: u8 = 11;
 }
 
 /// A control message from a client to the relay.
@@ -370,7 +371,10 @@ pub enum ClientControl {
         /// The infohash to announce.
         info_hash: InfoHash,
     },
-    /// Asks the relay to stop refreshing the announcement for an infohash.
+    /// Asks the relay to stop refreshing the announcement for an infohash. The relay
+    /// answers with [`RelayControl::DhtStopped`].
+    ///
+    /// The DHT has no way to delete an announcement, it expires on its own.
     DhtStop {
         /// The infohash to stop announcing.
         info_hash: InfoHash,
@@ -410,6 +414,11 @@ pub enum RelayControl {
         info_hash: InfoHash,
         /// Whether the infohash is announced.
         status: DhtStatus,
+    },
+    /// Acknowledges a [`ClientControl::DhtStop`].
+    DhtStopped {
+        /// The infohash of the request.
+        info_hash: InfoHash,
     },
     /// Peers found for a [`ClientControl::DhtFindPeers`]. Sent as they arrive.
     DhtPeers {
@@ -600,6 +609,10 @@ impl RelayControl {
                 dst.put_slice(info_hash);
                 dst.put_u8((*status).into());
             }
+            Self::DhtStopped { info_hash } => {
+                dst.put_u8(control_type::DHT_STOPPED);
+                dst.put_slice(info_hash);
+            }
             Self::DhtPeers { request_id, peers } => {
                 dst.put_u8(control_type::DHT_PEERS);
                 dst.put_u32(*request_id);
@@ -645,6 +658,9 @@ impl RelayControl {
             control_type::DHT_ANNOUNCE_RESULT => Self::DhtAnnounceResult {
                 info_hash: get_array(&mut bytes)?,
                 status: get_u8(&mut bytes)?.into(),
+            },
+            control_type::DHT_STOPPED => Self::DhtStopped {
+                info_hash: get_array(&mut bytes)?,
             },
             control_type::DHT_PEERS => {
                 let request_id = get_u32(&mut bytes)?;
@@ -772,6 +788,7 @@ mod tests {
                     status: status.into(),
                 }
             }),
+            any::<InfoHash>().prop_map(|info_hash| RelayControl::DhtStopped { info_hash }),
             (any::<u32>(), prop::collection::vec(socket_addr(), 0..32))
                 .prop_map(|(request_id, peers)| RelayControl::DhtPeers { request_id, peers }),
             (any::<u32>(), any::<u8>()).prop_map(|(request_id, status)| {

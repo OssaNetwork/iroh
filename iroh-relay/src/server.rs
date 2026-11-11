@@ -49,6 +49,8 @@ use crate::{
 
 pub mod allocator;
 pub mod auth;
+#[cfg(feature = "dht")]
+pub mod dht;
 pub mod http_server;
 mod metrics;
 pub mod policy;

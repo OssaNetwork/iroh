@@ -9,9 +9,10 @@ iroh's own relay protocol has been removed from this crate. It currently
 provides:
 - Relay Protocol: the frames exchanged between a relay and its clients.
 - Relay Server: gives each authenticated client a public UDP port and forwards
-  packets between that port and the client's control channel. Also serves
-  latency probe and captive portal endpoints, and optionally a QAD endpoint
-  and metrics.
+  packets between that port and the client's control channel. Serves a TCP
+  fallback for dialers whose network blocks UDP, and can announce and look up
+  peers on the mainline DHT for its clients. Also serves latency probe and
+  captive portal endpoints, and optionally a QAD endpoint and metrics.
 - Relay Client: a UDP socket for a QUIC stack that is also reachable through
   relays, and the connection to a relay behind it.
 - Server Binary: A CLI for running your own relay server.
@@ -83,6 +84,40 @@ interval shorter than that.
 
 The dialer needs code for this, a stock QUIC client only speaks UDP. See
 `RelaySocketHandle::open_tunnel` and `race_udp_and_tunnel` in the client.
+
+### Mainline DHT
+
+A mainline DHT `announce_peer` records the address the announcement comes
+from. A client behind the relay can therefore not announce itself, the DHT
+would record its own address. The relay can do it instead: it runs one DHT
+node and, on request of a client, announces its own IP address with the port
+of the client, keeps the announcement fresh, and looks up the peers of an
+infohash.
+
+```toml
+[allocations.dht]
+# The UDP port of the relay's DHT node. Chosen by the operating system if not
+# set. It has to be reachable from the internet.
+# port = 6881
+# The nodes to join the DHT through. Defaults to the well known nodes of the
+# mainline DHT.
+# bootstrap = ["router.bittorrent.com:6881"]
+# How often announcements are refreshed. Defaults to 900.
+# refresh_interval_secs = 900
+```
+
+This needs a binary built with the `dht` feature:
+`cargo build --package iroh-relay --features server,dht`.
+
+A client's announcements live as long as its port: the relay keeps refreshing
+them while the client is away during the release timeout, and stops when the
+port is released. The DHT has no way to delete an announcement, entries
+expire on their own.
+
+The relay learns every infohash its clients announce or look up. Which
+requests are served is decided by `iroh_relay::server::dht::DhtPolicy` when
+the relay is embedded as a library. The binary serves all of them, up to 1024
+announced infohashes and 16 concurrent lookups per client.
 
 ### Authentication
 

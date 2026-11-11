@@ -58,6 +58,7 @@ webpki_types = { package = "rustls-pki-types", version = "1.12" }
 
 # server feature
 clap = { version = "4", features = ["derive"], optional = true }
+n0-mainline = { version = "0.7.1", optional = true }
 rcgen = { version = "0.14", optional = true }
 reloadable-state = { version = "0.1", optional = true }
 rustls-cert-reloadable-resolver = { version = "0.7.1", optional = true }
@@ -115,6 +116,8 @@ server = [
     "iroh-metrics/service",
     "tls-ring",
 ]
+# Lets the relay announce and look up peers on the mainline DHT for its clients.
+dht = ["server", "dep:n0-mainline"]
 metrics = ["iroh-metrics/metrics"]
 test-utils = []
 tls-ring = [
@@ -135,6 +138,10 @@ tls-aws-lc-rs = [
 [[test]]
 name = "control"
 required-features = ["server", "test-utils"]
+
+[[test]]
+name = "dht"
+required-features = ["server", "dht", "test-utils"]
 
 [[test]]
 name = "tunnel"

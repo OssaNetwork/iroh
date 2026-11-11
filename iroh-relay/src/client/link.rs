@@ -1,6 +1,7 @@
 //! A client's connection to a relay.
 
 use std::{
+    collections::{HashMap, HashSet},
     net::SocketAddrV4,
     pin::Pin,
     sync::Arc,
@@ -11,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use n0_error::{e, stack_error};
 use n0_future::{Sink, SinkExt, Stream, StreamExt, time};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, trace, warn};
 
@@ -25,7 +26,7 @@ use crate::{
     protos::{
         relay::{
             CONTROL_RELATIVE_PATH, CONTROL_SUBPROTOCOL, ClientControl, ClientFrame, Datagram,
-            DecodeError, EncodeError, ErrorCode, RelayControl, RelayFrame,
+            DecodeError, DhtStatus, EncodeError, ErrorCode, InfoHash, RelayControl, RelayFrame,
         },
         streams::StreamError,
     },
@@ -57,6 +58,9 @@ const OUTBOUND_QUEUE_DEPTH: usize = 512;
 
 /// How many queued packets are written to the control channel before it is flushed.
 const WRITE_BATCH: usize = 64;
+
+/// How many DHT requests wait for the link's task.
+const COMMAND_QUEUE_DEPTH: usize = 64;
 
 /// Produces the credentials a client presents to a relay.
 ///
@@ -294,6 +298,72 @@ impl LinkState {
     }
 }
 
+/// A request to the mainline DHT service of a relay was not served.
+#[stack_error(derive, add_meta)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum DhtError {
+    #[error("the relay's policy refused the request")]
+    Denied,
+    #[error("the request failed")]
+    Failed,
+    #[error("the relay does not offer the DHT service")]
+    Unavailable,
+    #[error("the link is not connected to the relay")]
+    NotConnected,
+    #[error("the control channel broke before the request was done")]
+    Disconnected,
+    #[error("the link gave up or was closed")]
+    Closed,
+    #[error("the relay answered with a status this version does not know: {status}")]
+    UnknownStatus { status: u8 },
+}
+
+impl DhtError {
+    /// Turns the status of an answer into a result.
+    fn check(status: DhtStatus) -> Result<(), Self> {
+        match status {
+            DhtStatus::Ok => Ok(()),
+            DhtStatus::Denied => Err(e!(Self::Denied)),
+            DhtStatus::Failed => Err(e!(Self::Failed)),
+            DhtStatus::Unavailable => Err(e!(Self::Unavailable)),
+            DhtStatus::Unknown(status) => Err(e!(Self::UnknownStatus { status })),
+        }
+    }
+}
+
+/// The peers found by [`RelayLink::dht_find_peers`].
+///
+/// A [`Stream`] of batches of peer addresses, in the order the relay finds them. The
+/// stream ends when the lookup is done. If the lookup fails the last item is the error.
+#[derive(Debug)]
+pub struct DhtPeers {
+    peers: mpsc::UnboundedReceiver<Result<Vec<SocketAddrV4>, DhtError>>,
+}
+
+impl Stream for DhtPeers {
+    type Item = Result<Vec<SocketAddrV4>, DhtError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
+        self.peers.poll_recv(cx)
+    }
+}
+
+/// A DHT request for the link's task.
+enum Command {
+    Announce {
+        info_hash: InfoHash,
+        done: oneshot::Sender<Result<(), DhtError>>,
+    },
+    Stop {
+        info_hash: InfoHash,
+    },
+    FindPeers {
+        info_hash: InfoHash,
+        peers: mpsc::UnboundedSender<Result<Vec<SocketAddrV4>, DhtError>>,
+    },
+}
+
 /// A packet received through a relay, together with the path it came on.
 #[derive(Debug)]
 pub(super) struct Inbound {
@@ -318,6 +388,7 @@ pub struct RelayLink {
     /// Stops the task. The task is not aborted, so that it can close the control channel
     /// properly.
     cancel: CancellationToken,
+    commands: mpsc::Sender<Command>,
     /// Removes the link from the socket when dropped.
     _registration: Registration,
 }
@@ -332,6 +403,7 @@ impl RelayLink {
         registration: Registration,
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(LinkState::Connecting);
+        let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
         let cancel = CancellationToken::new();
         let actor = Actor {
             index,
@@ -341,6 +413,8 @@ impl RelayLink {
             outbound,
             state: state_tx,
             cancel: cancel.clone(),
+            commands: commands_rx,
+            dht: DhtState::default(),
         };
         n0_future::task::spawn(
             actor
@@ -351,6 +425,7 @@ impl RelayLink {
             index,
             state: state_rx,
             cancel,
+            commands: commands_tx,
             _registration: registration,
         }
     }
@@ -393,6 +468,57 @@ impl RelayLink {
         }
     }
 
+    /// Asks the relay to announce this link's public address for `info_hash` on the
+    /// mainline DHT, and to keep the announcement fresh.
+    ///
+    /// The DHT records the address an announcement comes from, so a client behind a relay
+    /// can not announce itself. The relay announces its own IP address with the port of
+    /// this link's allocation.
+    ///
+    /// Returns when the relay has announced. The link remembers the infohash and asks
+    /// again whenever it reconnects, so one call is enough for the life of the link.
+    /// While the link is not connected the call waits for it to connect.
+    ///
+    /// The relay learns the infohash.
+    pub async fn dht_announce(&self, info_hash: InfoHash) -> Result<(), DhtError> {
+        let (done, result) = oneshot::channel();
+        self.commands
+            .send(Command::Announce { info_hash, done })
+            .await
+            .map_err(|_| e!(DhtError::Closed))?;
+        result.await.map_err(|_| e!(DhtError::Closed))?
+    }
+
+    /// Asks the relay to stop refreshing the announcement for `info_hash`.
+    ///
+    /// The DHT has no way to delete an announcement. It expires on its own, after about
+    /// half an hour.
+    pub async fn dht_stop(&self, info_hash: InfoHash) -> Result<(), DhtError> {
+        self.commands
+            .send(Command::Stop { info_hash })
+            .await
+            .map_err(|_| e!(DhtError::Closed))
+    }
+
+    /// Asks the relay to look up the peers of `info_hash` on the mainline DHT.
+    ///
+    /// The peers arrive on the returned stream as the relay finds them. A peer that is
+    /// itself behind a relay appears with the address of its relay. The lookup fails
+    /// right away if the link is not connected.
+    ///
+    /// The relay learns the infohash.
+    pub async fn dht_find_peers(&self, info_hash: InfoHash) -> Result<DhtPeers, DhtError> {
+        let (peers_tx, peers_rx) = mpsc::unbounded_channel();
+        self.commands
+            .send(Command::FindPeers {
+                info_hash,
+                peers: peers_tx,
+            })
+            .await
+            .map_err(|_| e!(DhtError::Closed))?;
+        Ok(DhtPeers { peers: peers_rx })
+    }
+
     /// Closes the control channel in the background. The link does not reconnect, and its
     /// state becomes [`LinkState::Closed`].
     pub fn close(&self) {
@@ -424,9 +550,150 @@ struct Actor {
     outbound: mpsc::Receiver<Datagram>,
     state: watch::Sender<LinkState>,
     cancel: CancellationToken,
+    commands: mpsc::Receiver<Command>,
+    dht: DhtState,
+}
+
+/// What the link knows about its DHT requests.
+#[derive(Default)]
+struct DhtState {
+    /// The infohashes the relay announces for the link, or is asked to. They are sent
+    /// again on every new control channel: the relay forgets them when it releases the
+    /// link's port.
+    announced: HashSet<InfoHash>,
+    /// Who waits for the answer to an announce request.
+    waiting: HashMap<InfoHash, Vec<oneshot::Sender<Result<(), DhtError>>>>,
+    /// The lookups that run on the current control channel, by request id.
+    lookups: HashMap<u32, mpsc::UnboundedSender<Result<Vec<SocketAddrV4>, DhtError>>>,
+    next_request_id: u32,
+}
+
+impl DhtState {
+    /// Handles a request while there is no control channel.
+    fn handle_offline(&mut self, command: Command) {
+        match command {
+            // Sent once the link is connected.
+            Command::Announce { info_hash, done } => {
+                self.announced.insert(info_hash);
+                self.waiting.entry(info_hash).or_default().push(done);
+            }
+            Command::Stop { info_hash } => self.forget(info_hash, e!(DhtError::Closed)),
+            Command::FindPeers { peers, .. } => {
+                let _ = peers.send(Err(e!(DhtError::NotConnected)));
+            }
+        }
+    }
+
+    /// Handles a request while there is a control channel. Returns what to send.
+    fn handle_online(&mut self, command: Command) -> ClientControl {
+        match command {
+            Command::Announce { info_hash, done } => {
+                self.announced.insert(info_hash);
+                self.waiting.entry(info_hash).or_default().push(done);
+                ClientControl::DhtAnnounce { info_hash }
+            }
+            Command::Stop { info_hash } => {
+                self.forget(info_hash, e!(DhtError::Closed));
+                ClientControl::DhtStop { info_hash }
+            }
+            Command::FindPeers { info_hash, peers } => {
+                let request_id = self.next_request_id;
+                self.next_request_id = self.next_request_id.wrapping_add(1);
+                self.lookups.insert(request_id, peers);
+                ClientControl::DhtFindPeers {
+                    request_id,
+                    info_hash,
+                }
+            }
+        }
+    }
+
+    /// Stops announcing `info_hash` and tells whoever waits for it `error`.
+    fn forget(&mut self, info_hash: InfoHash, error: DhtError) {
+        self.announced.remove(&info_hash);
+        let mut error = Some(error);
+        for done in self.waiting.remove(&info_hash).unwrap_or_default() {
+            // The error can not be cloned. The first to wait gets it, the others learn
+            // from their dropped sender that the request is over.
+            if let Some(error) = error.take() {
+                let _ = done.send(Err(error));
+            }
+        }
+    }
+
+    /// Handles an answer of the relay. Returns whether it was a DHT message.
+    fn handle_answer(&mut self, control: &RelayControl) -> bool {
+        match control {
+            RelayControl::DhtAnnounceResult { info_hash, status } => {
+                match DhtError::check(*status) {
+                    Ok(()) => {
+                        for done in self.waiting.remove(info_hash).unwrap_or_default() {
+                            let _ = done.send(Ok(()));
+                        }
+                    }
+                    // The relay does not announce it. Do not ask again on reconnect, the
+                    // caller knows and decides.
+                    Err(err) => self.forget(*info_hash, err),
+                }
+                true
+            }
+            RelayControl::DhtPeers { request_id, peers } => {
+                if let Some(lookup) = self.lookups.get(request_id) {
+                    let _ = lookup.send(Ok(peers.clone()));
+                }
+                true
+            }
+            RelayControl::DhtFindPeersDone { request_id, status } => {
+                if let Some(lookup) = self.lookups.remove(request_id)
+                    && let Err(err) = DhtError::check(*status)
+                {
+                    let _ = lookup.send(Err(err));
+                }
+                true
+            }
+            RelayControl::DhtStopped { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// The control channel is gone. Lookups do not survive it, announcements do.
+    fn disconnected(&mut self) {
+        for (_, lookup) in self.lookups.drain() {
+            let _ = lookup.send(Err(e!(DhtError::Disconnected)));
+        }
+    }
+}
+
+/// What happened while the link waited without a control channel.
+enum Offline<T> {
+    /// The future the link waited for completed.
+    Done(T),
+    /// The link was closed.
+    Closed,
 }
 
 impl Actor {
+    /// Drives `fut` while there is no control channel.
+    ///
+    /// Packets can not be sent meanwhile. They are dropped, so that they do not queue up
+    /// to be sent late. DHT requests are answered or kept for later.
+    async fn while_offline<T>(&mut self, fut: impl Future<Output = T>) -> Offline<T> {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => return Offline::Closed,
+                res = &mut fut => return Offline::Done(res),
+                packet = self.outbound.recv() => {
+                    // The socket dropped its end, the link is no longer in use.
+                    if packet.is_none() {
+                        return Offline::Closed;
+                    }
+                }
+                Some(command) = self.commands.recv() => self.dht.handle_offline(command),
+            }
+        }
+    }
+
     async fn run(mut self) {
         let last = self.connect_and_serve().await;
         // Whoever still looks at the link sees why it is over.
@@ -438,13 +705,13 @@ impl Actor {
     async fn connect_and_serve(&mut self) -> LinkState {
         let mut backoff = MIN_BACKOFF;
         loop {
-            let connect = ControlClient::connect(&self.dialer, self.credentials.as_ref());
-            let client = tokio::select! {
-                _ = self.cancel.cancelled() => return LinkState::Closed,
-                // Packets can not be sent while there is no control channel. Do not let
-                // them queue up to be sent late.
-                _ = discard(&mut self.outbound) => return LinkState::Closed,
-                res = connect => res,
+            let dialer = self.dialer.clone();
+            let credentials = self.credentials.clone();
+            let connect =
+                async move { ControlClient::connect(&dialer, credentials.as_ref()).await };
+            let client = match self.while_offline(connect).await {
+                Offline::Done(res) => res,
+                Offline::Closed => return LinkState::Closed,
             };
             let ended = match client {
                 Ok(client) => {
@@ -453,6 +720,7 @@ impl Actor {
                         .send_replace(LinkState::Connected(client.public_addr()));
                     let connected = time::Instant::now();
                     let ended = self.serve(client).await;
+                    self.dht.disconnected();
                     if connected.elapsed() >= STABLE_AFTER {
                         backoff = MIN_BACKOFF;
                     }
@@ -477,10 +745,8 @@ impl Actor {
             }
             // Wait before the next attempt, a little longer every time it fails.
             let jitter = backoff.mul_f64(rand::random::<f64>() * 0.5);
-            tokio::select! {
-                _ = self.cancel.cancelled() => return LinkState::Closed,
-                _ = discard(&mut self.outbound) => return LinkState::Closed,
-                _ = time::sleep(backoff + jitter) => {}
+            if let Offline::Closed = self.while_offline(time::sleep(backoff + jitter)).await {
+                return LinkState::Closed;
             }
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
@@ -488,6 +754,23 @@ impl Actor {
 
     /// Runs one control channel until it ends.
     async fn serve(&mut self, mut client: ControlClient) -> Ended {
+        // The relay forgets the announcements when it releases the link's port. Ask for
+        // all of them on every control channel, the relay answers at once for those it
+        // still has.
+        let announced: Vec<InfoHash> = self.dht.announced.iter().copied().collect();
+        for info_hash in announced {
+            let frame = ClientFrame::Control(ClientControl::DhtAnnounce { info_hash });
+            if client.feed(frame).await.is_err() {
+                return Ended::Broken("write failed");
+            }
+        }
+        if !matches!(
+            time::timeout(WRITE_TIMEOUT, client.flush()).await,
+            Ok(Ok(()))
+        ) {
+            return Ended::Broken("write failed");
+        }
+
         let idle = time::sleep(IDLE_TIMEOUT);
         tokio::pin!(idle);
         loop {
@@ -497,6 +780,13 @@ impl Actor {
                     return Ended::Cancelled;
                 }
                 _ = &mut idle => return Ended::Broken("the relay went silent"),
+                Some(command) = self.commands.recv() => {
+                    let control = self.dht.handle_online(command);
+                    let write = client.send(ClientFrame::Control(control));
+                    if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
+                        return Ended::Broken("write failed");
+                    }
+                }
                 first = self.outbound.recv() => {
                     // The socket dropped its end, the link is no longer in use.
                     let Some(first) = first else {
@@ -556,9 +846,12 @@ impl Actor {
                                 _ => Ended::Broken("the relay reported an error"),
                             };
                         }
-                        // The address does not change on an open control channel, and
-                        // nothing here waits for the other control messages.
-                        RelayFrame::Control(_) => None,
+                        RelayFrame::Control(control) => {
+                            // The address does not change on an open control channel,
+                            // and nothing waits for the other control messages.
+                            self.dht.handle_answer(&control);
+                            None
+                        }
                     };
                     if let Some(control) = reply {
                         let write = client.send(ClientFrame::Control(control));
@@ -578,9 +871,4 @@ async fn feed(client: &mut ControlClient, datagram: Datagram) -> Result<(), Cont
         Err(ControlError::Encode { .. }) => Ok(()),
         res => res,
     }
-}
-
-/// Drops the packets that are queued for the relay, until the sender is gone.
-async fn discard(outbound: &mut mpsc::Receiver<Datagram>) {
-    while outbound.recv().await.is_some() {}
 }

@@ -39,7 +39,10 @@ mod util;
 
 pub use self::{
     addr::{PathAddr, RelayIndex},
-    link::{ControlClient, ControlError, Credentials, CredentialsError, LinkState, RelayLink},
+    link::{
+        ControlClient, ControlError, Credentials, CredentialsError, DhtError, DhtPeers, LinkState,
+        RelayLink,
+    },
     race::{FallbackMemory, RaceError, TUNNEL_RACE_DELAY, Winner, race_udp_and_tunnel},
     socket::{RelaySocket, RelaySocketHandle},
     tunnel::{TunnelConfig, TunnelLink, TunnelState},
