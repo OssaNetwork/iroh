@@ -248,6 +248,8 @@ struct Attachment {
     inbound: mpsc::Sender<Bytes>,
     /// Cancelled when another control channel takes over the allocation.
     superseded: CancellationToken,
+    /// Cancelled when the relay disconnects the client.
+    disconnected: CancellationToken,
 }
 
 /// Locks a mutex, ignoring poisoning.
@@ -475,6 +477,25 @@ impl Relay {
         lock(&self.0.state).allocator.port_of(identity)
     }
 
+    /// Closes the control channel of `identity`, if it is connected.
+    ///
+    /// Returns whether a control channel was closed. The client's port stays reserved for
+    /// the release timeout, and nothing keeps the client from connecting again. To keep a
+    /// client out, have the authenticator reject it.
+    pub fn disconnect(&self, identity: &ClientId) -> bool {
+        let state = lock(&self.0.state);
+        let Some(allocation) = state.allocations.get(identity) else {
+            return false;
+        };
+        match lock(&allocation.shared.attached).as_ref() {
+            Some(attachment) => {
+                attachment.disconnected.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Closes all control channels and releases all allocations.
     ///
     /// No allocations are created afterwards.
@@ -670,10 +691,12 @@ impl Relay {
 
             let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
             let superseded = CancellationToken::new();
+            let disconnected = CancellationToken::new();
             let previous = lock(&shared.attached).replace(Attachment {
                 generation: lease.generation,
                 inbound: inbound_tx,
                 superseded: superseded.clone(),
+                disconnected: disconnected.clone(),
             });
             if let Some(previous) = previous {
                 previous.superseded.cancel();
@@ -685,6 +708,7 @@ impl Relay {
                 generation: lease.generation,
                 inbound: inbound_rx,
                 superseded,
+                disconnected,
                 relay: self.clone(),
             }));
         }
@@ -767,6 +791,7 @@ struct Attached {
     generation: u64,
     inbound: mpsc::Receiver<Bytes>,
     superseded: CancellationToken,
+    disconnected: CancellationToken,
     relay: Relay,
 }
 
@@ -896,6 +921,12 @@ async fn serve<S: BytesStreamSink>(io: &mut S, attached: &mut Attached, relay: &
     loop {
         tokio::select! {
             _ = attached.superseded.cancelled() => return Exit::superseded(),
+            _ = attached.disconnected.cancelled() => {
+                return Exit {
+                    reason: "disconnected by the relay",
+                    goodbye: Goodbye::Close,
+                };
+            }
             _ = relay.0.shutdown.cancelled() => {
                 return Exit {
                     reason: "relay is shutting down",

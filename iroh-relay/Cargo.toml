@@ -136,6 +136,10 @@ tls-aws-lc-rs = [
 name = "control"
 required-features = ["server", "test-utils"]
 
+[[test]]
+name = "socket"
+required-features = ["server", "test-utils"]
+
 [[bin]]
 name = "iroh-relay"
 path = "src/main.rs"

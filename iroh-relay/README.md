@@ -12,7 +12,8 @@ provides:
   packets between that port and the client's control channel. Also serves
   latency probe and captive portal endpoints, and optionally a QAD endpoint
   and metrics.
-- Relay Client: a WebSocket dialer for connecting to the relay.
+- Relay Client: a UDP socket for a QUIC stack that is also reachable through
+  relays, and the connection to a relay behind it.
 - Server Binary: A CLI for running your own relay server.
 
 ## Build the server

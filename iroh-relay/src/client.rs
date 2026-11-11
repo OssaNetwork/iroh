@@ -1,7 +1,11 @@
 //! Client-side connection establishment to a relay server.
 //!
-//! [`WsDialer`] opens a WebSocket to one of the relay's endpoints. It handles DNS
-//! resolution, happy-eyeballs dialing, HTTP proxies and TLS.
+//! - [`WsDialer`] opens a WebSocket to one of the relay's endpoints. It handles DNS
+//!   resolution, happy-eyeballs dialing, HTTP proxies and TLS.
+//! - [`RelaySocket`] is a UDP socket for a QUIC stack that is also reachable through
+//!   relays. A [`RelayLink`] connects it to one relay and keeps the connection open.
+//! - [`ControlClient`] is a single control channel to a relay, for those who want to
+//!   speak the protocol themselves.
 
 use std::{
     net::SocketAddr,
@@ -24,9 +28,18 @@ use crate::{
     protos::streams::{StreamError, WsBytesFramed},
 };
 
+mod addr;
+mod link;
+mod socket;
 pub(crate) mod streams;
 mod tls;
 mod util;
+
+pub use self::{
+    addr::{PathAddr, RelayIndex},
+    link::{ControlClient, ControlError, Credentials, CredentialsError, LinkState, RelayLink},
+    socket::{RelaySocket, RelaySocketHandle},
+};
 
 /// Connection errors.
 ///
