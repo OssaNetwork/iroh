@@ -18,6 +18,13 @@
 //!
 //! Dialers that can not reach the relay over UDP open a *tunnel*, a second kind of
 //! WebSocket. Each binary message on a tunnel is one QUIC packet without any header.
+//!
+//! # Compatibility
+//!
+//! A receiver must ignore a control message whose type it does not know, which
+//! [`DecodeError::is_unknown_control`] reports, instead of closing the connection. This
+//! allows adding control messages without a new subprotocol. All other decoding errors
+//! are protocol violations.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -46,15 +53,18 @@ pub const DATAGRAM_HEADER_LEN: usize = 7;
 /// This is the largest payload a UDP datagram can carry over IPv4.
 pub const MAX_PACKET_SIZE: usize = 65_507;
 
-/// The maximum size of a message on the control channel or on a tunnel.
+/// The maximum size of a message on the control channel.
 pub const MAX_FRAME_SIZE: usize = MAX_PACKET_SIZE + DATAGRAM_HEADER_LEN;
+
+/// The maximum size of a message on a tunnel, which carries packets without a header.
+pub const MAX_TUNNEL_FRAME_SIZE: usize = MAX_PACKET_SIZE;
 
 /// The maximum length of the credentials in [`ClientControl::Auth`].
 pub const MAX_CREDENTIALS_LEN: usize = 8 * 1024;
 
 /// The maximum length in bytes of the reason in [`RelayControl::Error`].
 ///
-/// Longer reasons are truncated when encoded.
+/// Longer reasons are truncated, both when encoded and when decoded.
 pub const MAX_REASON_LEN: usize = 256;
 
 /// The maximum number of peers in a single [`RelayControl::DhtPeers`].
@@ -150,28 +160,30 @@ impl Datagram {
         DATAGRAM_HEADER_LEN + self.payload.len()
     }
 
-    fn write_to(&self, dst: &mut BytesMut) {
+    fn write_to(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        ensure!(
+            self.payload.len() <= MAX_PACKET_SIZE,
+            EncodeError::PacketTooLarge {
+                len: self.payload.len()
+            }
+        );
+        dst.reserve(self.encoded_len());
         dst.put_u8(if self.remote.tunnel { Flags::TUNNEL } else { 0 });
-        dst.put_slice(&self.remote.addr.ip().octets());
-        dst.put_u16(self.remote.addr.port());
+        put_socket_addr(dst, &self.remote.addr);
         dst.put_slice(&self.payload);
+        Ok(())
     }
 
     /// Parses a datagram, `bytes` starts after the flags byte.
     fn parse(flags: Flags, mut bytes: Bytes) -> Result<Self, DecodeError> {
-        ensure!(
-            bytes.len() >= DATAGRAM_HEADER_LEN - 1,
-            DecodeError::TooShort
-        );
-        let ip = Ipv4Addr::from(bytes.get_u32());
-        let port = bytes.get_u16();
+        let addr = get_socket_addr(&mut bytes)?;
         ensure!(
             bytes.len() <= MAX_PACKET_SIZE,
             DecodeError::PacketTooLarge { len: bytes.len() }
         );
         Ok(Self {
             remote: RemoteAddr {
-                addr: SocketAddrV4::new(ip, port),
+                addr,
                 tunnel: flags.is_tunnel(),
             },
             payload: bytes,
@@ -198,6 +210,30 @@ pub enum DecodeError {
     TrailingBytes { len: usize },
 }
 
+impl DecodeError {
+    /// Returns whether the message was a control message of a type this version does not
+    /// know. Such messages must be ignored.
+    pub fn is_unknown_control(&self) -> bool {
+        matches!(self, Self::UnknownControl { .. })
+    }
+}
+
+/// Errors when encoding a message.
+///
+/// The limits are the ones the receiver enforces. Encoding fails instead of producing a
+/// message the receiver would reject.
+#[stack_error(derive, add_meta)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum EncodeError {
+    #[error("packet of {len} bytes is too large")]
+    PacketTooLarge { len: usize },
+    #[error("credentials of {len} bytes are too large")]
+    CredentialsTooLarge { len: usize },
+    #[error("{len} peers do not fit into one message")]
+    TooManyPeers { len: usize },
+}
+
 /// Why the relay refused a request or closed the control channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -213,6 +249,8 @@ pub enum ErrorCode {
     /// The relay failed internally.
     Internal,
     /// A code this version does not know.
+    ///
+    /// Produced when decoding. Do not construct it with the value of a known code.
     Unknown(u8),
 }
 
@@ -255,6 +293,8 @@ pub enum DhtStatus {
     /// The relay does not offer the DHT service.
     Unavailable,
     /// A status this version does not know.
+    ///
+    /// Produced when decoding. Do not construct it with the value of a known status.
     Unknown(u8),
 }
 
@@ -363,7 +403,8 @@ pub enum RelayControl {
     DhtPeers {
         /// The id of the request.
         request_id: u32,
-        /// At most [`MAX_DHT_PEERS_PER_FRAME`] peer addresses.
+        /// At most [`MAX_DHT_PEERS_PER_FRAME`] peer addresses. More peers are sent in
+        /// further messages.
         peers: Vec<SocketAddrV4>,
     },
     /// A [`ClientControl::DhtFindPeers`] is finished, no more peers follow.
@@ -392,6 +433,9 @@ pub enum RelayFrame {
     /// A control message.
     Control(RelayControl),
 }
+
+/// Capacity reserved up front for a control message, enough for all fixed-size ones.
+const CONTROL_RESERVE: usize = 32;
 
 fn put_socket_addr(dst: &mut BytesMut, addr: &SocketAddrV4) {
     dst.put_slice(&addr.ip().octets());
@@ -444,10 +488,18 @@ fn truncate_str(s: &str, max: usize) -> &str {
 }
 
 impl ClientControl {
-    fn write_to(&self, dst: &mut BytesMut) {
+    fn write_to(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.reserve(CONTROL_RESERVE);
         dst.put_u8(Flags::CONTROL);
         match self {
             Self::Auth { credentials } => {
+                ensure!(
+                    credentials.len() <= MAX_CREDENTIALS_LEN,
+                    EncodeError::CredentialsTooLarge {
+                        len: credentials.len()
+                    }
+                );
+                dst.reserve(1 + credentials.len());
                 dst.put_u8(control_type::AUTH);
                 dst.put_slice(credentials);
             }
@@ -476,6 +528,7 @@ impl ClientControl {
                 dst.put_slice(info_hash);
             }
         }
+        Ok(())
     }
 
     /// Parses a control message, `bytes` starts after the flags byte.
@@ -509,7 +562,8 @@ impl ClientControl {
 }
 
 impl RelayControl {
-    fn write_to(&self, dst: &mut BytesMut) {
+    fn write_to(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.reserve(CONTROL_RESERVE);
         dst.put_u8(Flags::CONTROL);
         match self {
             Self::Allocated { addr } => {
@@ -537,7 +591,11 @@ impl RelayControl {
             Self::DhtPeers { request_id, peers } => {
                 dst.put_u8(control_type::DHT_PEERS);
                 dst.put_u32(*request_id);
-                let peers = &peers[..peers.len().min(MAX_DHT_PEERS_PER_FRAME)];
+                ensure!(
+                    peers.len() <= MAX_DHT_PEERS_PER_FRAME,
+                    EncodeError::TooManyPeers { len: peers.len() }
+                );
+                dst.reserve(6 + 6 * peers.len());
                 dst.put_u16(peers.len() as u16);
                 for peer in peers {
                     put_socket_addr(dst, peer);
@@ -549,6 +607,7 @@ impl RelayControl {
                 dst.put_u8((*status).into());
             }
         }
+        Ok(())
     }
 
     /// Parses a control message, `bytes` starts after the flags byte.
@@ -564,7 +623,9 @@ impl RelayControl {
                     bytes.len() <= MAX_REASON_LEN,
                     DecodeError::FieldTooLarge { len: bytes.len() }
                 );
-                let reason = String::from_utf8_lossy(&bytes).into_owned();
+                // Invalid UTF-8 is replaced, which can lengthen the reason.
+                let reason = String::from_utf8_lossy(&bytes);
+                let reason = truncate_str(&reason, MAX_REASON_LEN).to_string();
                 return Ok(Self::Error { code, reason });
             }
             control_type::PING => Self::Ping(get_array(&mut bytes)?),
@@ -601,16 +662,15 @@ macro_rules! impl_frame {
     ($frame:ident, $control:ident) => {
         impl $frame {
             /// Encodes the frame into one WebSocket message.
-            pub fn to_bytes(&self) -> Bytes {
+            ///
+            /// Fails if the frame exceeds a limit the receiver enforces.
+            pub fn to_bytes(&self) -> Result<Bytes, EncodeError> {
                 let mut dst = BytesMut::new();
                 match self {
-                    Self::Datagram(datagram) => {
-                        dst.reserve(datagram.encoded_len());
-                        datagram.write_to(&mut dst);
-                    }
-                    Self::Control(control) => control.write_to(&mut dst),
+                    Self::Datagram(datagram) => datagram.write_to(&mut dst)?,
+                    Self::Control(control) => control.write_to(&mut dst)?,
                 }
-                dst.freeze()
+                Ok(dst.freeze())
             }
 
             /// Decodes one WebSocket message.
@@ -719,7 +779,7 @@ mod tests {
                 client_control().prop_map(ClientFrame::Control),
             ]
         ) {
-            let decoded = ClientFrame::from_bytes(frame.to_bytes()).unwrap();
+            let decoded = ClientFrame::from_bytes(frame.to_bytes().unwrap()).unwrap();
             prop_assert_eq!(decoded, frame);
         }
 
@@ -730,7 +790,7 @@ mod tests {
                 relay_control().prop_map(RelayFrame::Control),
             ]
         ) {
-            let decoded = RelayFrame::from_bytes(frame.to_bytes()).unwrap();
+            let decoded = RelayFrame::from_bytes(frame.to_bytes().unwrap()).unwrap();
             prop_assert_eq!(decoded, frame);
         }
 
@@ -750,7 +810,7 @@ mod tests {
             payload: Bytes::from_static(b"quic"),
         });
         assert_eq!(
-            &frame.to_bytes()[..],
+            &frame.to_bytes().unwrap()[..],
             &[0x01, 192, 0, 2, 7, 0x12, 0x34, b'q', b'u', b'i', b'c']
         );
 
@@ -758,7 +818,10 @@ mod tests {
             remote: RemoteAddr::udp(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), 443)),
             payload: Bytes::new(),
         });
-        assert_eq!(&frame.to_bytes()[..], &[0x00, 192, 0, 2, 7, 0x01, 0xbb]);
+        assert_eq!(
+            &frame.to_bytes().unwrap()[..],
+            &[0x00, 192, 0, 2, 7, 0x01, 0xbb]
+        );
     }
 
     #[test]
@@ -826,22 +889,71 @@ mod tests {
             reason,
         });
         let RelayFrame::Control(RelayControl::Error { reason, .. }) =
-            RelayFrame::from_bytes(frame.to_bytes()).unwrap()
+            RelayFrame::from_bytes(frame.to_bytes().unwrap()).unwrap()
         else {
             panic!("wrong frame");
         };
         assert_eq!(reason, "é".repeat(MAX_REASON_LEN / 2));
 
-        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
-        let frame = RelayFrame::Control(RelayControl::DhtPeers {
-            request_id: 1,
-            peers: vec![peer; MAX_DHT_PEERS_PER_FRAME + 5],
-        });
-        let RelayFrame::Control(RelayControl::DhtPeers { peers, .. }) =
-            RelayFrame::from_bytes(frame.to_bytes()).unwrap()
+        // Invalid UTF-8 grows when replaced, the decoded reason stays bounded.
+        let mut bytes = vec![Flags::CONTROL, control_type::ERROR, 5];
+        bytes.extend(std::iter::repeat_n(0xffu8, MAX_REASON_LEN));
+        let RelayFrame::Control(RelayControl::Error { reason, .. }) =
+            RelayFrame::from_bytes(Bytes::from(bytes)).unwrap()
         else {
             panic!("wrong frame");
         };
-        assert_eq!(peers.len(), MAX_DHT_PEERS_PER_FRAME);
+        assert!(reason.len() <= MAX_REASON_LEN);
+    }
+
+    #[test]
+    fn encoding_enforces_the_receivers_limits() {
+        let remote = RemoteAddr::udp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        let datagram = |len| {
+            ClientFrame::Datagram(Datagram {
+                remote,
+                payload: vec![0u8; len].into(),
+            })
+        };
+        assert!(datagram(MAX_PACKET_SIZE).to_bytes().is_ok());
+        assert!(matches!(
+            datagram(MAX_PACKET_SIZE + 1).to_bytes(),
+            Err(EncodeError::PacketTooLarge { .. })
+        ));
+
+        let auth = |len| {
+            ClientFrame::Control(ClientControl::Auth {
+                credentials: vec![0u8; len].into(),
+            })
+        };
+        assert!(auth(MAX_CREDENTIALS_LEN).to_bytes().is_ok());
+        assert!(matches!(
+            auth(MAX_CREDENTIALS_LEN + 1).to_bytes(),
+            Err(EncodeError::CredentialsTooLarge { .. })
+        ));
+
+        let peers = |len| {
+            RelayFrame::Control(RelayControl::DhtPeers {
+                request_id: 1,
+                peers: vec![remote.addr; len],
+            })
+        };
+        let full = peers(MAX_DHT_PEERS_PER_FRAME);
+        assert_eq!(
+            RelayFrame::from_bytes(full.to_bytes().unwrap()).unwrap(),
+            full
+        );
+        assert!(matches!(
+            peers(MAX_DHT_PEERS_PER_FRAME + 1).to_bytes(),
+            Err(EncodeError::TooManyPeers { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_control_is_distinguishable() {
+        let err = RelayFrame::from_bytes(Bytes::from_static(&[0x80, 0xff])).unwrap_err();
+        assert!(err.is_unknown_control());
+        let err = RelayFrame::from_bytes(Bytes::from_static(&[0x80])).unwrap_err();
+        assert!(!err.is_unknown_control());
     }
 }
