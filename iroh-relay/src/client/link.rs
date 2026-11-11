@@ -62,6 +62,9 @@ const WRITE_BATCH: usize = 64;
 /// How many DHT requests wait for the link's task.
 const COMMAND_QUEUE_DEPTH: usize = 64;
 
+/// How long the link waits before it asks again for an announcement that failed.
+const ANNOUNCE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Produces the credentials a client presents to a relay.
 ///
 /// What the credentials contain is agreed between the client and the relay's
@@ -315,6 +318,8 @@ pub enum DhtError {
     Disconnected,
     #[error("the link gave up or was closed")]
     Closed,
+    #[error("the announcement was stopped before the relay answered")]
+    Stopped,
     #[error("the relay answered with a status this version does not know: {status}")]
     UnknownStatus { status: u8 },
 }
@@ -328,6 +333,25 @@ impl DhtError {
             DhtStatus::Failed => Err(e!(Self::Failed)),
             DhtStatus::Unavailable => Err(e!(Self::Unavailable)),
             DhtStatus::Unknown(status) => Err(e!(Self::UnknownStatus { status })),
+        }
+    }
+}
+
+/// How an announce request ended. Unlike the error this can be copied, to tell everyone
+/// who waits for the same infohash.
+#[derive(Debug, Clone, Copy)]
+enum AnnounceOutcome {
+    /// The relay answered.
+    Answered(DhtStatus),
+    /// The announcement was stopped before the relay answered.
+    Stopped,
+}
+
+impl AnnounceOutcome {
+    fn into_result(self) -> Result<(), DhtError> {
+        match self {
+            Self::Answered(status) => DhtError::check(status),
+            Self::Stopped => Err(e!(DhtError::Stopped)),
         }
     }
 }
@@ -353,7 +377,7 @@ impl Stream for DhtPeers {
 enum Command {
     Announce {
         info_hash: InfoHash,
-        done: oneshot::Sender<Result<(), DhtError>>,
+        done: oneshot::Sender<AnnounceOutcome>,
     },
     Stop {
         info_hash: InfoHash,
@@ -476,7 +500,9 @@ impl RelayLink {
     /// this link's allocation.
     ///
     /// Returns when the relay has announced. The link remembers the infohash and asks
-    /// again whenever it reconnects, so one call is enough for the life of the link.
+    /// again whenever it reconnects, so one call is enough for the life of the link. If
+    /// the relay later fails to announce, the link keeps asking. If the relay later
+    /// refuses, because its policy changed, the link stops asking and logs a warning.
     /// While the link is not connected the call waits for it to connect.
     ///
     /// The relay learns the infohash.
@@ -486,7 +512,10 @@ impl RelayLink {
             .send(Command::Announce { info_hash, done })
             .await
             .map_err(|_| e!(DhtError::Closed))?;
-        result.await.map_err(|_| e!(DhtError::Closed))?
+        result
+            .await
+            .map_err(|_| e!(DhtError::Closed))?
+            .into_result()
     }
 
     /// Asks the relay to stop refreshing the announcement for `info_hash`.
@@ -562,7 +591,16 @@ struct DhtState {
     /// link's port.
     announced: HashSet<InfoHash>,
     /// Who waits for the answer to an announce request.
-    waiting: HashMap<InfoHash, Vec<oneshot::Sender<Result<(), DhtError>>>>,
+    waiting: HashMap<InfoHash, Vec<oneshot::Sender<AnnounceOutcome>>>,
+    /// The infohashes whose announcement was stopped, until the relay acknowledges it.
+    ///
+    /// A stop request can get lost: there may be no control channel, or the one it is
+    /// written to may be breaking. The relay would keep announcing. What is in here is
+    /// sent again on the next control channel.
+    unacked_stops: HashSet<InfoHash>,
+    /// The infohashes the relay failed to announce when nobody waited for the answer.
+    /// The link asks again after a while.
+    retry: HashSet<InfoHash>,
     /// The lookups that run on the current control channel, by request id.
     lookups: HashMap<u32, mpsc::UnboundedSender<Result<Vec<SocketAddrV4>, DhtError>>>,
     next_request_id: u32,
@@ -574,10 +612,14 @@ impl DhtState {
         match command {
             // Sent once the link is connected.
             Command::Announce { info_hash, done } => {
+                self.unacked_stops.remove(&info_hash);
                 self.announced.insert(info_hash);
                 self.waiting.entry(info_hash).or_default().push(done);
             }
-            Command::Stop { info_hash } => self.forget(info_hash, e!(DhtError::Closed)),
+            Command::Stop { info_hash } => {
+                self.forget(info_hash, AnnounceOutcome::Stopped);
+                self.unacked_stops.insert(info_hash);
+            }
             Command::FindPeers { peers, .. } => {
                 let _ = peers.send(Err(e!(DhtError::NotConnected)));
             }
@@ -588,12 +630,17 @@ impl DhtState {
     fn handle_online(&mut self, command: Command) -> ClientControl {
         match command {
             Command::Announce { info_hash, done } => {
+                // The relay handles requests in order. A stop that is still on its way
+                // comes first, and one that got lost no longer matters.
+                self.unacked_stops.remove(&info_hash);
                 self.announced.insert(info_hash);
+                self.retry.remove(&info_hash);
                 self.waiting.entry(info_hash).or_default().push(done);
                 ClientControl::DhtAnnounce { info_hash }
             }
             Command::Stop { info_hash } => {
-                self.forget(info_hash, e!(DhtError::Closed));
+                self.forget(info_hash, AnnounceOutcome::Stopped);
+                self.unacked_stops.insert(info_hash);
                 ClientControl::DhtStop { info_hash }
             }
             Command::FindPeers { info_hash, peers } => {
@@ -608,32 +655,58 @@ impl DhtState {
         }
     }
 
-    /// Stops announcing `info_hash` and tells whoever waits for it `error`.
-    fn forget(&mut self, info_hash: InfoHash, error: DhtError) {
+    /// Stops announcing `info_hash` and tells everyone who waits for it `outcome`.
+    fn forget(&mut self, info_hash: InfoHash, outcome: AnnounceOutcome) {
         self.announced.remove(&info_hash);
-        let mut error = Some(error);
-        for done in self.waiting.remove(&info_hash).unwrap_or_default() {
-            // The error can not be cloned. The first to wait gets it, the others learn
-            // from their dropped sender that the request is over.
-            if let Some(error) = error.take() {
-                let _ = done.send(Err(error));
-            }
+        self.retry.remove(&info_hash);
+        self.answer(&info_hash, outcome);
+    }
+
+    /// Tells everyone who waits for `info_hash` `outcome`. Returns whether anyone did.
+    fn answer(&mut self, info_hash: &InfoHash, outcome: AnnounceOutcome) -> bool {
+        let waiting = self.waiting.remove(info_hash).unwrap_or_default();
+        let any = !waiting.is_empty();
+        for done in waiting {
+            let _ = done.send(outcome);
         }
+        any
     }
 
     /// Handles an answer of the relay. Returns whether it was a DHT message.
     fn handle_answer(&mut self, control: &RelayControl) -> bool {
         match control {
             RelayControl::DhtAnnounceResult { info_hash, status } => {
-                match DhtError::check(*status) {
-                    Ok(()) => {
-                        for done in self.waiting.remove(info_hash).unwrap_or_default() {
-                            let _ = done.send(Ok(()));
+                // An answer to a request that was stopped meanwhile.
+                if !self.announced.contains(info_hash) {
+                    return true;
+                }
+                let outcome = AnnounceOutcome::Answered(*status);
+                match status {
+                    DhtStatus::Ok => {
+                        self.retry.remove(info_hash);
+                        self.answer(info_hash, outcome);
+                    }
+                    DhtStatus::Failed => {
+                        // Whoever asked is told and decides. If nobody asked, this was
+                        // the link asking again after a reconnect: the caller was told
+                        // that the infohash is announced, so keep at it.
+                        if self.answer(info_hash, outcome) {
+                            self.announced.remove(info_hash);
+                        } else {
+                            self.retry.insert(*info_hash);
                         }
                     }
-                    // The relay does not announce it. Do not ask again on reconnect, the
-                    // caller knows and decides.
-                    Err(err) => self.forget(*info_hash, err),
+                    // The relay will not announce it however often it is asked.
+                    _ => {
+                        if !self.answer(info_hash, outcome) {
+                            warn!(
+                                ?status,
+                                "the relay no longer announces an infohash on the DHT"
+                            );
+                        }
+                        self.announced.remove(info_hash);
+                        self.retry.remove(info_hash);
+                    }
                 }
                 true
             }
@@ -651,7 +724,10 @@ impl DhtState {
                 }
                 true
             }
-            RelayControl::DhtStopped { .. } => true,
+            RelayControl::DhtStopped { info_hash } => {
+                self.unacked_stops.remove(info_hash);
+                true
+            }
             _ => false,
         }
     }
@@ -661,6 +737,27 @@ impl DhtState {
         for (_, lookup) in self.lookups.drain() {
             let _ = lookup.send(Err(e!(DhtError::Disconnected)));
         }
+        // Everything is asked for again on the next control channel anyway.
+        self.retry.clear();
+    }
+
+    /// Returns what to tell the relay about the announcements on a new control channel.
+    fn resume(&mut self) -> Vec<ClientControl> {
+        // The stops the relay did not acknowledge are sent again, and stay until it
+        // does. An infohash can not be in both sets.
+        let stops = self
+            .unacked_stops
+            .iter()
+            .map(|info_hash| ClientControl::DhtStop {
+                info_hash: *info_hash,
+            });
+        let announces = self
+            .announced
+            .iter()
+            .map(|info_hash| ClientControl::DhtAnnounce {
+                info_hash: *info_hash,
+            });
+        stops.chain(announces).collect()
     }
 }
 
@@ -757,20 +854,21 @@ impl Actor {
         // The relay forgets the announcements when it releases the link's port. Ask for
         // all of them on every control channel, the relay answers at once for those it
         // still has.
-        let announced: Vec<InfoHash> = self.dht.announced.iter().copied().collect();
-        for info_hash in announced {
-            let frame = ClientFrame::Control(ClientControl::DhtAnnounce { info_hash });
-            if client.feed(frame).await.is_err() {
-                return Ended::Broken("write failed");
+        let resume = self.dht.resume();
+        let write = async {
+            for control in resume {
+                client.feed(ClientFrame::Control(control)).await?;
             }
-        }
-        if !matches!(
-            time::timeout(WRITE_TIMEOUT, client.flush()).await,
-            Ok(Ok(()))
-        ) {
+            client.flush().await
+        };
+        if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
             return Ended::Broken("write failed");
         }
 
+        let mut retry_announces = time::interval(ANNOUNCE_RETRY_INTERVAL);
+        retry_announces.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        // The first tick of an interval completes immediately. Wait a full interval.
+        retry_announces.reset();
         let idle = time::sleep(IDLE_TIMEOUT);
         tokio::pin!(idle);
         loop {
@@ -780,6 +878,19 @@ impl Actor {
                     return Ended::Cancelled;
                 }
                 _ = &mut idle => return Ended::Broken("the relay went silent"),
+                _ = retry_announces.tick(), if !self.dht.retry.is_empty() => {
+                    let retry: Vec<InfoHash> = self.dht.retry.drain().collect();
+                    let write = async {
+                        for info_hash in retry {
+                            let control = ClientControl::DhtAnnounce { info_hash };
+                            client.feed(ClientFrame::Control(control)).await?;
+                        }
+                        client.flush().await
+                    };
+                    if !matches!(time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
+                        return Ended::Broken("write failed");
+                    }
+                }
                 Some(command) = self.commands.recv() => {
                     let control = self.dht.handle_online(command);
                     let write = client.send(ClientFrame::Control(control));
@@ -870,5 +981,187 @@ async fn feed(client: &mut ControlClient, datagram: Datagram) -> Result<(), Cont
     match client.feed(ClientFrame::Datagram(datagram)).await {
         Err(ControlError::Encode { .. }) => Ok(()),
         res => res,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H1: InfoHash = [1; 20];
+    const H2: InfoHash = [2; 20];
+
+    fn announce(
+        state: &mut DhtState,
+        info_hash: InfoHash,
+        online: bool,
+    ) -> oneshot::Receiver<AnnounceOutcome> {
+        let (done, result) = oneshot::channel();
+        let command = Command::Announce { info_hash, done };
+        if online {
+            state.handle_online(command);
+        } else {
+            state.handle_offline(command);
+        }
+        result
+    }
+
+    fn answer(state: &mut DhtState, info_hash: InfoHash, status: DhtStatus) {
+        assert!(state.handle_answer(&RelayControl::DhtAnnounceResult { info_hash, status }));
+    }
+
+    #[test]
+    fn everyone_waiting_gets_the_answer() {
+        let mut state = DhtState::default();
+        let mut first = announce(&mut state, H1, true);
+        let mut second = announce(&mut state, H1, true);
+        answer(&mut state, H1, DhtStatus::Denied);
+        for result in [&mut first, &mut second] {
+            let err = result.try_recv().unwrap().into_result().unwrap_err();
+            assert!(matches!(err, DhtError::Denied { .. }), "{err:?}");
+        }
+        // The caller was told, the link does not ask again.
+        assert!(state.resume().is_empty());
+
+        let mut ok = announce(&mut state, H1, true);
+        answer(&mut state, H1, DhtStatus::Ok);
+        assert!(ok.try_recv().unwrap().into_result().is_ok());
+        assert_eq!(
+            state.resume(),
+            vec![ClientControl::DhtAnnounce { info_hash: H1 }]
+        );
+    }
+
+    #[test]
+    fn failure_after_reconnect_is_retried() {
+        let mut state = DhtState::default();
+        let mut done = announce(&mut state, H1, true);
+        answer(&mut state, H1, DhtStatus::Ok);
+        assert!(done.try_recv().unwrap().into_result().is_ok());
+
+        // The link reconnects and asks again. Nobody waits for this answer.
+        state.disconnected();
+        assert_eq!(
+            state.resume(),
+            vec![ClientControl::DhtAnnounce { info_hash: H1 }]
+        );
+        answer(&mut state, H1, DhtStatus::Failed);
+        // The caller was told that the infohash is announced: keep at it.
+        assert!(state.retry.contains(&H1));
+        assert!(state.announced.contains(&H1));
+        answer(&mut state, H1, DhtStatus::Ok);
+        assert!(state.retry.is_empty());
+
+        // A failure the caller waits for is the caller's to handle.
+        let mut done = announce(&mut state, H2, true);
+        answer(&mut state, H2, DhtStatus::Failed);
+        let err = done.try_recv().unwrap().into_result().unwrap_err();
+        assert!(matches!(err, DhtError::Failed { .. }), "{err:?}");
+        assert!(!state.announced.contains(&H2));
+        assert!(state.retry.is_empty());
+
+        // A refusal ends it, however it was asked.
+        state.disconnected();
+        state.resume();
+        answer(&mut state, H1, DhtStatus::Denied);
+        assert!(state.announced.is_empty());
+        assert!(state.retry.is_empty());
+    }
+
+    #[test]
+    fn stop_is_sent_until_the_relay_acknowledges_it() {
+        let mut state = DhtState::default();
+        let mut done = announce(&mut state, H1, true);
+        answer(&mut state, H1, DhtStatus::Ok);
+        assert!(done.try_recv().unwrap().into_result().is_ok());
+
+        // Stopped on a control channel that breaks before the relay reads the request.
+        assert_eq!(
+            state.handle_online(Command::Stop { info_hash: H1 }),
+            ClientControl::DhtStop { info_hash: H1 }
+        );
+        state.disconnected();
+        // Another one is stopped while there is no control channel at all.
+        let mut gone = announce(&mut state, H2, false);
+        state.handle_offline(Command::Stop { info_hash: H2 });
+        assert!(matches!(
+            gone.try_recv().unwrap().into_result(),
+            Err(DhtError::Stopped { .. })
+        ));
+
+        // Both are sent on the next control channel, and again on the one after it, until
+        // the relay says it got them.
+        for _ in 0..2 {
+            let mut resume = state.resume();
+            resume.sort_by_key(|control| format!("{control:?}"));
+            assert_eq!(
+                resume,
+                vec![
+                    ClientControl::DhtStop { info_hash: H1 },
+                    ClientControl::DhtStop { info_hash: H2 },
+                ]
+            );
+            state.disconnected();
+        }
+        assert!(state.handle_answer(&RelayControl::DhtStopped { info_hash: H1 }));
+        assert_eq!(
+            state.resume(),
+            vec![ClientControl::DhtStop { info_hash: H2 }]
+        );
+
+        // Announcing again takes the stop back.
+        let _again = announce(&mut state, H2, false);
+        assert_eq!(
+            state.resume(),
+            vec![ClientControl::DhtAnnounce { info_hash: H2 }]
+        );
+    }
+
+    #[test]
+    fn stop_answers_whoever_waits() {
+        let mut state = DhtState::default();
+        let mut done = announce(&mut state, H1, true);
+        state.handle_online(Command::Stop { info_hash: H1 });
+        let err = done.try_recv().unwrap().into_result().unwrap_err();
+        assert!(matches!(err, DhtError::Stopped { .. }), "{err:?}");
+        // The relay's late answer to the stopped request changes nothing.
+        answer(&mut state, H1, DhtStatus::Ok);
+        assert!(state.announced.is_empty());
+    }
+
+    #[test]
+    fn lookups_end_with_the_control_channel() {
+        let mut state = DhtState::default();
+        let (peers, mut results) = mpsc::unbounded_channel();
+        let control = state.handle_online(Command::FindPeers {
+            info_hash: H1,
+            peers,
+        });
+        let ClientControl::DhtFindPeers { request_id, .. } = control else {
+            panic!("wrong message");
+        };
+        let found = vec![SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1)];
+        state.handle_answer(&RelayControl::DhtPeers {
+            request_id,
+            peers: found.clone(),
+        });
+        assert_eq!(results.try_recv().unwrap().unwrap(), found);
+        state.disconnected();
+        let err = results.try_recv().unwrap().unwrap_err();
+        assert!(matches!(err, DhtError::Disconnected { .. }), "{err:?}");
+        // The stream ends after the error.
+        assert!(matches!(
+            results.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        // Offline, a lookup fails right away.
+        let (peers, mut results) = mpsc::unbounded_channel();
+        state.handle_offline(Command::FindPeers {
+            info_hash: H1,
+            peers,
+        });
+        let err = results.try_recv().unwrap().unwrap_err();
+        assert!(matches!(err, DhtError::NotConnected { .. }), "{err:?}");
     }
 }

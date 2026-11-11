@@ -18,7 +18,7 @@
 //! its allocation. [`Relay::open_tunnel`] attaches a dialer's WebSocket to an allocation.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::RangeInclusive,
     sync::{
@@ -253,6 +253,12 @@ struct DhtService {
     #[debug("Dht")]
     dht: n0_mainline::Dht,
     policy: Arc<dyn super::dht::DhtPolicy>,
+    /// Limits how many announcements are on their way to the DHT at a time, for all
+    /// clients together. Without it a relay that all clients reconnect to at once would
+    /// flood its own DHT node.
+    announce_slots: Arc<tokio::sync::Semaphore>,
+    /// Counts the announce requests, to tell entries for the same infohash apart.
+    next_request: std::sync::atomic::AtomicU64,
     /// Refreshes the announcements of all clients.
     refresh_task: Mutex<Option<AbortOnDropHandle<()>>>,
 }
@@ -315,8 +321,20 @@ struct AllocationShared {
     ///
     /// They live and die with the allocation: the relay refreshes them while the client
     /// is away during the release timeout, and forgets them when the port is released.
-    announces: Mutex<HashSet<InfoHash>>,
+    announces: Mutex<HashMap<InfoHash, Announce>>,
     metrics: Arc<Metrics>,
+}
+
+/// An infohash the relay announces for a client.
+#[derive(Debug, Clone, Copy)]
+struct Announce {
+    /// Tells this entry from an earlier one for the same infohash that was stopped.
+    #[cfg_attr(not(feature = "dht"), allow(dead_code))]
+    request: u64,
+    /// Whether an announcement went out at least once. Until then the client was not
+    /// told that the infohash is announced.
+    #[cfg_attr(not(feature = "dht"), allow(dead_code))]
+    announced: bool,
 }
 
 /// What an allocation knows about one of its tunnels.
@@ -555,6 +573,10 @@ impl Relay {
                     .build(config.public_ip)
                     .map_err(|err| e!(InvalidConfig::Dht, err))?,
                 policy: dht_config.policy.clone(),
+                announce_slots: Arc::new(tokio::sync::Semaphore::new(
+                    super::dht::ANNOUNCE_CONCURRENCY,
+                )),
+                next_request: Default::default(),
                 refresh_task: Mutex::new(None),
             }),
             None => None,
@@ -579,9 +601,20 @@ impl Relay {
         });
         #[cfg(feature = "dht")]
         if let (Some(service), Some(interval)) = (&inner.dht, refresh_interval) {
+            // The DHT node has a UDP port of its own. Keep it out of the hands of
+            // clients. A port the operating system chose is only known to the node, the
+            // refresh task asks for it.
+            if let Some(port) = inner.config.dht.as_ref().and_then(|dht| dht.port) {
+                lock(&inner.state).allocator.exclude_port(port);
+            }
             let task = tokio::spawn(
-                refresh_announces(Arc::downgrade(&inner), service.dht.clone(), interval)
-                    .instrument(info_span!("relay-dht-refresh")),
+                refresh_announces(
+                    Arc::downgrade(&inner),
+                    service.dht.clone(),
+                    service.announce_slots.clone(),
+                    interval,
+                )
+                .instrument(info_span!("relay-dht-refresh")),
             );
             *lock(&service.refresh_task) = Some(AbortOnDropHandle::new(task));
         }
@@ -650,7 +683,7 @@ impl Relay {
     pub fn announced(&self, identity: &ClientId) -> Vec<InfoHash> {
         let state = lock(&self.0.state);
         match state.allocations.get(identity) {
-            Some(allocation) => lock(&allocation.shared.announces).iter().copied().collect(),
+            Some(allocation) => lock(&allocation.shared.announces).keys().copied().collect(),
             None => Vec::new(),
         }
     }
@@ -1069,7 +1102,7 @@ impl Inner {
             tunnels: Mutex::new(HashMap::new()),
             max_tunnels: self.config.max_tunnels,
             released: CancellationToken::new(),
-            announces: Mutex::new(HashSet::new()),
+            announces: Mutex::new(HashMap::new()),
             metrics: self.metrics.clone(),
         });
         let reader = tokio::spawn(
@@ -1230,6 +1263,8 @@ async fn serve<S: BytesStreamSink>(io: &mut S, attached: &mut Attached, relay: &
                     return Exit::silent("write failed");
                 }
             }
+            // Take finished tasks out of the set, it would keep them around otherwise.
+            Some(_) = dht.tasks.join_next() => {}
             _ = attached.disconnected.cancelled() => {
                 return Exit {
                     reason: "disconnected by the relay",
@@ -1479,38 +1514,78 @@ impl DhtSession {
         let Some(service) = &relay.0.dht else {
             return answer(DhtStatus::Unavailable);
         };
-        {
-            let mut announces = lock(&shared.announces);
-            // Already announced, and kept fresh. This is what a client sees that
-            // reconnected within the release timeout and announces again.
-            if announces.contains(&info_hash) {
-                return answer(DhtStatus::Ok);
+        let (known, announced) = {
+            let announces = lock(&shared.announces);
+            (announces.get(&info_hash).copied(), announces.len())
+        };
+        let request = match known {
+            // Announced, and kept fresh. This is what a client sees that reconnected
+            // within the release timeout and announces again.
+            Some(Announce {
+                announced: true, ..
+            }) => return answer(DhtStatus::Ok),
+            // Asked for before, but no announcement went out yet: the request is still
+            // on its way, or its task ended with the control channel that made it.
+            // Announce for this request as well, so that it gets a true answer.
+            Some(Announce { request, .. }) => request,
+            None => {
+                // The policy is not called with the lock held, it may want to look at
+                // the relay.
+                let request = DhtRequest {
+                    identity: &shared.identity,
+                    kind: DhtRequestKind::Announce,
+                    info_hash: &info_hash,
+                    announced,
+                    lookups: self.lookups.load(Ordering::Relaxed),
+                };
+                if announced >= MAX_ANNOUNCES_PER_CLIENT || !service.policy.allow(&request) {
+                    shared.metrics.dht_requests_denied.inc();
+                    return answer(DhtStatus::Denied);
+                }
+                let request = service.next_request.fetch_add(1, Ordering::Relaxed);
+                let mut announces = lock(&shared.announces);
+                // Requests of one client are handled one after the other, the entry can
+                // not have appeared in between. The limit may have been reached by
+                // another control channel that took over, which then lost this request.
+                announces.entry(info_hash).or_insert(Announce {
+                    request,
+                    announced: false,
+                });
+                request
             }
-            let request = DhtRequest {
-                identity: &shared.identity,
-                kind: DhtRequestKind::Announce,
-                info_hash: &info_hash,
-                announced: announces.len(),
-                lookups: self.lookups.load(Ordering::Relaxed),
-            };
-            if announces.len() >= MAX_ANNOUNCES_PER_CLIENT || !service.policy.allow(&request) {
-                shared.metrics.dht_requests_denied.inc();
-                return answer(DhtStatus::Denied);
-            }
-            announces.insert(info_hash);
-        }
+        };
 
         let dht = service.dht.clone();
+        let slots = service.announce_slots.clone();
         let shared = shared.clone();
         let report = self.report.clone();
         self.tasks.spawn(async move {
-            let status = if announce(&dht, &shared.metrics, info_hash, shared.port).await {
-                DhtStatus::Ok
-            } else {
-                // The client is told that it failed, so do not keep trying behind its
-                // back. It can ask again.
-                lock(&shared.announces).remove(&info_hash);
-                DhtStatus::Failed
+            let Ok(_slot) = slots.acquire().await else {
+                return;
+            };
+            let ok = announce(&dht, &shared.metrics, info_hash, shared.port).await;
+            let status = {
+                let mut announces = lock(&shared.announces);
+                match announces.get_mut(&info_hash) {
+                    // Still the entry this request is about.
+                    Some(entry) if entry.request == request => {
+                        if ok {
+                            entry.announced = true;
+                            DhtStatus::Ok
+                        } else if entry.announced {
+                            // Another request for the entry got through.
+                            DhtStatus::Ok
+                        } else {
+                            // The client is told that it failed, so do not keep trying
+                            // behind its back. It can ask again.
+                            announces.remove(&info_hash);
+                            DhtStatus::Failed
+                        }
+                    }
+                    // The client stopped the announcement meanwhile, and maybe asked
+                    // for it again. This answer is not about what it has now.
+                    _ => return,
+                }
             };
             let _ = report
                 .send(RelayControl::DhtAnnounceResult { info_hash, status })
@@ -1618,46 +1693,75 @@ async fn announce(
 
 /// Announces the infohashes of all clients again, every `interval`.
 #[cfg(feature = "dht")]
-async fn refresh_announces(relay: Weak<Inner>, dht: n0_mainline::Dht, interval: Duration) {
+async fn refresh_announces(
+    relay: Weak<Inner>,
+    dht: n0_mainline::Dht,
+    slots: Arc<tokio::sync::Semaphore>,
+    interval: Duration,
+) {
     // The DHT node has a UDP port of its own. Keep it out of the hands of clients.
-    if let Ok(info) = dht.info().await
-        && let Some(inner) = relay.upgrade()
-    {
-        lock(&inner.state)
-            .allocator
-            .exclude_port(info.local_addr().port());
+    match dht.info().await {
+        Ok(info) => {
+            if let Some(inner) = relay.upgrade() {
+                lock(&inner.state)
+                    .allocator
+                    .exclude_port(info.local_addr().port());
+            }
+        }
+        Err(err) => warn!("failed to learn the port of the DHT node: {err:#}"),
     }
+    // Ticks are counted from when a pass starts, not from when it ends. A pass that
+    // takes long does not push the next one back by as much.
+    let mut ticks = time::interval(interval);
+    ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // The first tick completes immediately.
+    ticks.tick().await;
     loop {
-        time::sleep(interval).await;
+        ticks.tick().await;
         let Some(inner) = relay.upgrade() else { return };
         if inner.shutdown.is_cancelled() {
             return;
         }
         // Allocations that are held for a client that is away are refreshed as well.
-        let announces: Vec<(u16, InfoHash)> = lock(&inner.state)
+        let announces: Vec<(Weak<AllocationShared>, InfoHash)> = lock(&inner.state)
             .allocations
             .values()
             .flat_map(|allocation| {
-                let port = allocation.shared.port;
+                let shared = Arc::downgrade(&allocation.shared);
                 let hashes: Vec<InfoHash> =
-                    lock(&allocation.shared.announces).iter().copied().collect();
-                hashes.into_iter().map(move |hash| (port, hash))
+                    lock(&allocation.shared.announces).keys().copied().collect();
+                hashes.into_iter().map(move |hash| (shared.clone(), hash))
             })
             .collect();
-        let metrics = inner.metrics.clone();
         // Do not keep the relay alive while announcing.
         drop(inner);
 
         let mut tasks = JoinSet::new();
-        for (port, info_hash) in announces {
-            if tasks.len() >= super::dht::REFRESH_CONCURRENCY {
-                tasks.join_next().await;
+        for (allocation, info_hash) in announces {
+            // The slots are shared with the announce requests of clients.
+            let Ok(slot) = slots.clone().acquire_owned().await else {
+                return;
+            };
+            // A pass can take a while. Look again whether the client still has the port
+            // and still wants the announcement: the port may belong to somebody else by
+            // now.
+            let Some(shared) = allocation.upgrade() else {
+                continue;
+            };
+            if shared.released.is_cancelled() || !lock(&shared.announces).contains_key(&info_hash) {
+                continue;
             }
             let dht = dht.clone();
-            let metrics = metrics.clone();
             tasks.spawn(async move {
-                announce(&dht, &metrics, info_hash, port).await;
+                let _slot = slot;
+                if announce(&dht, &shared.metrics, info_hash, shared.port).await
+                    && let Some(entry) = lock(&shared.announces).get_mut(&info_hash)
+                {
+                    entry.announced = true;
+                }
             });
+            // Take finished tasks out of the set.
+            while tasks.try_join_next().is_some() {}
         }
         while tasks.join_next().await.is_some() {}
     }

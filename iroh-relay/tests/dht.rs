@@ -290,6 +290,71 @@ async fn announcements_end_with_the_allocation() {
     assert_eq!(metrics.server.dht_announces.get(), announces);
 }
 
+#[tokio::test]
+async fn stop_reaches_the_relay_across_a_reconnect() {
+    let setup = setup(|config| config.release_timeout = Duration::from_secs(600)).await;
+    let relay = setup.relay();
+    let bob_id = ClientId::new("bob");
+    let bob = client(&setup, "bob").await;
+    bob.link.dht_announce(info_hash(1)).await.unwrap();
+    bob.link.dht_announce(info_hash(2)).await.unwrap();
+
+    // The control channel breaks, and the announcement is stopped right then. The relay
+    // holds Bob's port and still has both announcements.
+    let mut state = bob.link.watch_state();
+    state.borrow_and_update();
+    assert!(relay.disconnect(&bob_id));
+    bob.link.dht_stop(info_hash(1)).await.unwrap();
+    // Whether the link was still connected when it handled the stop or not, the relay
+    // must end up without the announcement.
+    eventually("the relay stopped the announcement", || {
+        relay.announced(&bob_id) == vec![info_hash(2)]
+    })
+    .await;
+    timeout(
+        TIMEOUT,
+        state.wait_for(|state| matches!(state, LinkState::Connected(_))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(relay.announced(&bob_id), vec![info_hash(2)]);
+}
+
+/// A policy that looks at the relay, which it can only do without a deadlock if the
+/// relay holds no lock while it asks the policy.
+#[derive(Debug, Default)]
+struct LooksAtTheRelay {
+    relay: std::sync::OnceLock<iroh_relay::server::Relay>,
+}
+
+impl DhtPolicy for LooksAtTheRelay {
+    fn allow(&self, request: &DhtRequest<'_>) -> bool {
+        let relay = self.relay.get().expect("set by the test");
+        relay.announced(request.identity).len() == request.announced
+    }
+}
+
+#[tokio::test]
+async fn policy_may_look_at_the_relay() {
+    let policy = Arc::new(LooksAtTheRelay::default());
+    let setup = setup(|config| {
+        config.dht.as_mut().unwrap().policy = policy.clone();
+    })
+    .await;
+    policy.relay.set(setup.relay().clone()).unwrap();
+    let bob = client(&setup, "bob").await;
+    timeout(TIMEOUT, bob.link.dht_announce(info_hash(1)))
+        .await
+        .expect("the relay deadlocked")
+        .unwrap();
+    timeout(TIMEOUT, bob.link.dht_announce(info_hash(2)))
+        .await
+        .expect("the relay deadlocked")
+        .unwrap();
+}
+
 /// Allows a client one announcement and no lookups.
 #[derive(Debug)]
 struct OneAnnouncement;

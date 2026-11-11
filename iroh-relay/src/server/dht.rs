@@ -29,8 +29,9 @@ pub const MAX_ANNOUNCES_PER_CLIENT: usize = 1024;
 /// The most lookups that run at a time for one client, whatever the policy allows.
 pub const MAX_LOOKUPS_PER_CLIENT: usize = 16;
 
-/// How many announcements the relay sends at a time when refreshing.
-pub(super) const REFRESH_CONCURRENCY: usize = 16;
+/// How many announcements are on their way to the DHT at a time, for all clients
+/// together.
+pub(super) const ANNOUNCE_CONCURRENCY: usize = 16;
 
 /// Configuration of the DHT service of a relay.
 #[derive(Debug, Clone)]
@@ -116,7 +117,8 @@ pub trait DhtPolicy: std::fmt::Debug + Send + Sync + 'static {
     /// Returns whether to serve `request`.
     ///
     /// Called for every announce and lookup request, on the task that serves the
-    /// client's control channel. It must not block.
+    /// client's control channel. It must not block. The relay holds no lock while it
+    /// calls this.
     fn allow(&self, request: &DhtRequest<'_>) -> bool;
 }
 
