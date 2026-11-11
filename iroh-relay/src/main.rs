@@ -4,7 +4,7 @@
 //! [`iroh_relay::server`].
 
 use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::Arc,
@@ -56,6 +56,8 @@ struct Cli {
 enum CertMode {
     Manual,
     LetsEncrypt,
+    /// A certificate for the relay's IP address, obtained through ACME.
+    LetsEncryptIp,
     #[cfg(feature = "server")]
     Reloading,
 }
@@ -439,6 +441,13 @@ struct TlsConfig {
     /// Certificate hostname when using LetsEncrypt.
     #[serde(default, deserialize_with = "string_or_seq")]
     hostname: Vec<String>,
+    /// The IP address to obtain a certificate for when using LetsEncryptIp.
+    ///
+    /// Defaults to the `public_ip` of the `allocations` section.
+    ///
+    /// The certificate authority connects to port 80 of this address to verify that the
+    /// relay controls it, so `http_bind_addr` has to be reachable there.
+    ip: Option<IpAddr>,
     /// Mode for getting a cert.
     ///
     /// Possible options: 'Manual', 'LetsEncrypt'.
@@ -613,7 +622,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn load_cert_config(tls: &TlsConfig) -> Result<relay::CertConfig> {
+/// Loads the certificate configuration. `public_ip` is the address clients advertise, if
+/// the relay accepts clients.
+async fn load_cert_config(
+    tls: &TlsConfig,
+    public_ip: Option<Ipv4Addr>,
+) -> Result<relay::CertConfig> {
     let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -671,6 +685,33 @@ async fn load_cert_config(tls: &TlsConfig) -> Result<relay::CertConfig> {
                 server_config_builder: server_config,
             }
         }
+        CertMode::LetsEncryptIp => {
+            let ip = tls
+                .ip
+                .or(public_ip.map(IpAddr::V4))
+                .std_context("LetsEncryptIp needs tls.ip or allocations.public_ip")?;
+            let mut acme_config = if let Ok(url) = std::env::var(ENV_ACME_URL) {
+                relay::IpAcmeConfig::new(url, ip)
+            } else {
+                relay::IpAcmeConfig::letsencrypt(tls.prod_tls, ip)
+            };
+            acme_config = acme_config.cache_path(tls.cert_dir());
+            if let Some(contact) = &tls.contact {
+                acme_config = acme_config.contact(vec![format!("mailto:{contact}")]);
+            }
+            if let Ok(ca_path) = std::env::var(ENV_ACME_CA) {
+                let extra_roots = CertificateDer::pem_file_iter(&ca_path)
+                    .std_context("failed to read IROH_RELAY_ACME_CA")?
+                    .collect::<Result<Vec<_>, _>>()
+                    .std_context("failed to parse IROH_RELAY_ACME_CA")?;
+                acme_config =
+                    acme_config.tls_config(CaTlsConfig::default().with_extra_roots(extra_roots));
+            }
+            relay::CertConfig::AcmeIp {
+                acme_config,
+                server_config_builder: server_config,
+            }
+        }
         CertMode::Reloading => {
             let resolver = reloading_resolver(
                 server_config.crypto_provider(),
@@ -689,7 +730,8 @@ async fn load_cert_config(tls: &TlsConfig) -> Result<relay::CertConfig> {
 /// Convert the TOML-loaded config to the [`relay::RelayConfig`] format.
 async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
     let (tls_config, quic_config) = if let Some(cfg_tls) = &cfg.tls {
-        let cert = load_cert_config(cfg_tls).await?;
+        let public_ip = cfg.allocations.as_ref().map(|config| config.public_ip);
+        let cert = load_cert_config(cfg_tls, public_ip).await?;
 
         // Use the server config from the relay::TlsConfig
         let quic_config = cfg
@@ -708,6 +750,9 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
                         relay::CertConfig::Manual { server_config } => Some(server_config),
                         relay::CertConfig::LetsEncrypt { .. } => {
                             bail_any!("--dev is incompatible with cert_mode LetsEncrypt")
+                        }
+                        relay::CertConfig::AcmeIp { .. } => {
+                            bail_any!("--dev is incompatible with cert_mode LetsEncryptIp")
                         }
                         _ => bail_any!("--dev is incompatible with this cert_mode"),
                     };
@@ -828,6 +873,45 @@ mod tests {
                 "config must be rejected: {invalid}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ip_cert_config() -> Result {
+        let dir = std::env::temp_dir().join("iroh-relay-test-ip-cert-config");
+        let config = |tls: &str, allocations: &str| {
+            format!(
+                "[tls]\ncert_mode = \"LetsEncryptIp\"\ncert_dir = \"{}\"\n{tls}\n{allocations}",
+                dir.display()
+            )
+        };
+        let allocations = "[allocations]\npublic_ip = \"203.0.113.5\"\nshared_tokens = [\"t\"]";
+        let ip_of = |cert: relay::CertConfig| match cert {
+            relay::CertConfig::AcmeIp { acme_config, .. } => {
+                assert_eq!(acme_config.cache_path.as_deref(), Some(dir.as_path()));
+                assert_eq!(acme_config.profile.as_deref(), Some("shortlived"));
+                acme_config.ip
+            }
+            other => panic!("unexpected certificate configuration: {other:?}"),
+        };
+
+        // The address defaults to the one clients advertise.
+        let cfg = Config::from_str(&config("", allocations))?;
+        let tls = cfg.tls.as_ref().expect("tls");
+        let public_ip = cfg.allocations.as_ref().map(|config| config.public_ip);
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        assert_eq!(ip_of(load_cert_config(tls, public_ip).await?), ip);
+
+        // An explicit address wins.
+        let cfg = Config::from_str(&config("ip = \"198.51.100.9\"", allocations))?;
+        let tls = cfg.tls.as_ref().expect("tls");
+        let ip: IpAddr = "198.51.100.9".parse().unwrap();
+        assert_eq!(ip_of(load_cert_config(tls, public_ip).await?), ip);
+
+        // Without either there is nothing to obtain a certificate for.
+        let cfg = Config::from_str(&config("", ""))?;
+        let tls = cfg.tls.as_ref().expect("tls");
+        assert!(load_cert_config(tls, None).await.is_err());
         Ok(())
     }
 

@@ -47,6 +47,7 @@ use crate::{
     tls::CaTlsConfig,
 };
 
+pub mod acme_ip;
 pub mod allocator;
 pub mod auth;
 #[cfg(feature = "dht")]
@@ -61,6 +62,7 @@ pub mod streams;
 pub mod testing;
 
 pub use self::{
+    acme_ip::{AcmeIpError, IpAcmeConfig},
     allocator::{ClientId, InvalidPortRange, PortAllocator},
     auth::{AuthRequest, Authenticator, DynAuthenticator, Rejected, SharedTokenAuthenticator},
     http_server::{Handlers, RelayService},
@@ -226,6 +228,20 @@ pub enum CertConfig {
         /// The ACME resolver will be injected when starting the server.
         server_config_builder: rustls::ConfigBuilder<rustls::ServerConfig, WantsServerCert>,
     },
+    /// Obtain a certificate for the relay's IP address from an ACME server.
+    ///
+    /// Dialers that fall back to the TCP tunnel verify the relay against its IP address,
+    /// see [`acme_ip`]. The ACME server connects to the relay's plain HTTP server, which
+    /// has to listen on port 80 of that address.
+    AcmeIp {
+        /// Configuration for the ACME client.
+        acme_config: IpAcmeConfig,
+        /// Builder for the [`rustls::ServerConfig`].
+        ///
+        /// The resolver that serves the certificate will be injected when starting the
+        /// server.
+        server_config_builder: rustls::ConfigBuilder<rustls::ServerConfig, WantsServerCert>,
+    },
     /// Use a TLS key and certificate chain that can be reloaded.
     Manual {
         /// The [`rustls::ServerConfig`] to use.
@@ -341,6 +357,8 @@ pub enum SpawnError {
     TlsHeaderParse { source: InvalidHeaderValue },
     #[error("Failed to bind TcpListener")]
     BindTlsListener { source: std::io::Error },
+    #[error("Failed to obtain a certificate for the IP address")]
+    AcmeIp { source: AcmeIpError },
     #[error("Invalid configuration of the allocations")]
     InvalidAllocationConfig { source: InvalidConfig },
     #[error("Failed to build ACME client TLS config")]
@@ -435,6 +453,7 @@ impl Server {
                     .request_handler(Method::GET, "/healthz", Box::new(healthz_handler));
                 let (http_addr, tls_config) = match relay_config.tls {
                     Some(tls_config) => {
+                        let mut ip_acme = None;
                         let server_tls_config = match tls_config.cert {
                             CertConfig::LetsEncrypt {
                                 acme_config,
@@ -478,6 +497,25 @@ impl Server {
                                     acceptor,
                                 }
                             }
+                            CertConfig::AcmeIp {
+                                acme_config,
+                                server_config_builder,
+                            } => {
+                                let crypto_provider =
+                                    server_config_builder.crypto_provider().clone();
+                                let acme = acme_ip::IpAcme::new(acme_config, crypto_provider)
+                                    .map_err(|err| e!(SpawnError::AcmeIp, err))?;
+                                let server_config = Arc::new(
+                                    server_config_builder.with_cert_resolver(acme.resolver()),
+                                );
+                                let acceptor =
+                                    tokio_rustls::TlsAcceptor::from(server_config.clone());
+                                ip_acme = Some(acme);
+                                http_server::TlsConfig {
+                                    config: server_config,
+                                    acceptor: http_server::TlsAcceptor::Manual(acceptor),
+                                }
+                            }
                             CertConfig::Manual { server_config } => {
                                 let server_config = Arc::new(server_config);
                                 let acceptor =
@@ -499,13 +537,30 @@ impl Server {
                         let http_addr = http_listener
                             .local_addr()
                             .map_err(|err| e!(SpawnError::NoLocalAddr, err))?;
+                        let challenges = ip_acme.as_ref().map(|acme| acme.challenges());
                         tasks.spawn(
                             async move {
-                                run_captive_portal_service(http_listener).await;
+                                run_captive_portal_service(http_listener, challenges).await;
                                 Ok(())
                             }
                             .instrument(info_span!("http-service", addr = %http_addr)),
                         );
+                        // The plain HTTP server answers the challenge of the ACME server,
+                        // so it has to be up before a certificate is asked for. The HTTPS
+                        // server is only started once there is a certificate to serve.
+                        if let Some(acme) = ip_acme {
+                            let renew_at = acme
+                                .ensure_certificate()
+                                .await
+                                .map_err(|err| e!(SpawnError::AcmeIp, err))?;
+                            tasks.spawn(
+                                async move {
+                                    acme.renew_forever(renew_at).await;
+                                    Ok(())
+                                }
+                                .instrument(info_span!("acme-ip")),
+                            );
+                        }
                         (Some(http_addr), Some(server_tls_config))
                     }
                     None => {
@@ -793,7 +848,10 @@ fn healthz_handler(
 }
 
 /// This is a future that never returns, drop it to cancel/abort.
-async fn run_captive_portal_service(http_listener: TcpListener) {
+async fn run_captive_portal_service(
+    http_listener: TcpListener,
+    challenges: Option<acme_ip::Challenges>,
+) {
     info!("serving");
 
     // If this future is cancelled, this is dropped and all tasks are aborted.
@@ -815,7 +873,9 @@ async fn run_captive_portal_service(http_listener: TcpListener) {
                 match res {
                     Ok((stream, peer_addr)) => {
                         debug!(%peer_addr, "Connection opened",);
-                        let handler = CaptivePortalService;
+                        let handler = CaptivePortalService {
+                            challenges: challenges.clone(),
+                        };
 
                         let stream = crate::server::streams::MaybeTlsStream::Plain(stream);
                         let stream = hyper_util::rt::TokioIo::new(stream);
@@ -842,8 +902,13 @@ async fn run_captive_portal_service(http_listener: TcpListener) {
     }
 }
 
+/// The services of the relay that are served over plain HTTP.
 #[derive(Clone)]
-struct CaptivePortalService;
+struct CaptivePortalService {
+    /// The challenges of an ACME server to answer, if the relay obtains its certificate
+    /// that way.
+    challenges: Option<acme_ip::Challenges>,
+}
 
 impl hyper::service::Service<Request<Incoming>> for CaptivePortalService {
     type Response = Response<BytesBody>;
@@ -851,6 +916,21 @@ impl hyper::service::Service<Request<Incoming>> for CaptivePortalService {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
+        // The http-01 challenge of ACME
+        if req.method() == Method::GET
+            && let Some(answer) = self
+                .challenges
+                .as_ref()
+                .and_then(|challenges| challenges.answer(req.uri().path()))
+        {
+            let body: BytesBody = Box::new(Full::from(answer));
+            let r = Response::builder()
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body)
+                .map_err(|err| Box::new(err) as HyperError);
+            return Box::pin(async move { r });
+        }
         match (req.method(), req.uri().path()) {
             // Captive Portal checker
             (&Method::GET, "/generate_204") => {

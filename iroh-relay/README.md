@@ -72,9 +72,32 @@ inside is still end to end between the dialer and the client.
 
 For this to work the relay's HTTPS server has to listen on port 443 of the
 public address, and present a certificate that is valid for that IP address.
-Dialers have nothing but the IP address to verify the relay against. Use
-`cert_mode = "Manual"` or `"Reloading"` with a certificate issued for the IP
-address.
+Dialers have nothing but the IP address to verify the relay against.
+
+The relay can obtain such a certificate from Let's Encrypt on its own:
+
+```toml
+[tls]
+cert_mode = "LetsEncryptIp"
+# Where the account and the certificate are kept between restarts.
+cert_dir = "/var/lib/iroh-relay/certs"
+# The address to obtain the certificate for. Defaults to the public_ip of the
+# allocations section.
+# ip = "203.0.113.5"
+# Optional, for notices from the certificate authority.
+# contact = "admin@example.com"
+# Set to false to use Let's Encrypt's staging environment.
+# prod_tls = true
+```
+
+The certificate authority verifies that the relay controls the address by
+fetching a token from port 80 of it, so `http_bind_addr` has to be reachable
+there. Certificates for IP addresses are valid for about six days. The relay
+renews them halfway through, without a restart. It does not start until it
+has a certificate.
+
+Alternatively use `cert_mode = "Manual"` or `"Reloading"` with a certificate
+issued for the IP address by other means.
 
 Anyone can open a tunnel, as anyone can send UDP packets to the port. When a
 client has `max_tunnels` tunnels, a new one replaces the oldest tunnel the

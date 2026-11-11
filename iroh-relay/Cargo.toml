@@ -26,7 +26,7 @@ derive_more = { version = "2.0.1", features = [
 http = "1"
 http-body-util = "0.1.0"
 hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = "0.1.1"
+hyper-util = "0.1.5"
 iroh-dns = { version = "1.4.1", path = "../iroh-dns" }
 iroh-metrics = { version = "1.0.2", default-features = false }
 n0-error = "1.0.0"
@@ -58,6 +58,8 @@ webpki_types = { package = "rustls-pki-types", version = "1.12" }
 
 # server feature
 clap = { version = "4", features = ["derive"], optional = true }
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "native-tokio", "tls12"], optional = true }
+instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring"], optional = true }
 n0-mainline = { version = "0.7.1", optional = true }
 rcgen = { version = "0.14", optional = true }
 reloadable-state = { version = "0.1", optional = true }
@@ -66,11 +68,13 @@ rustls-cert-file-reader = { version = "0.4.2", optional = true }
 time = { version = "0.3.37", optional = true }
 tokio-rustls-acme = { version = "0.9", optional = true }
 toml = { version = "1.0", optional = true }
+x509-parser = { version = "0.18", optional = true }
 sha1 = { version = "0.11.0", optional = true }
 serde_json = { version = "1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
+rcgen = { version = "0.14", features = ["x509-parser"] }
 proptest = "1.11.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 clap = { version = "4", features = ["derive"] }
@@ -100,6 +104,12 @@ server = [
     "tokio/signal",
     "tokio/rt-multi-thread",
     "dep:clap",
+    "dep:hyper-rustls",
+    "dep:instant-acme",
+    "dep:x509-parser",
+    "hyper-util/client-legacy",
+    "hyper-util/http1",
+    "hyper-util/tokio",
     "dep:rcgen",
     "dep:reloadable-state",
     "dep:rustls-cert-file-reader",
@@ -137,6 +147,10 @@ tls-aws-lc-rs = [
 
 [[test]]
 name = "control"
+required-features = ["server", "test-utils"]
+
+[[test]]
+name = "acme_ip"
 required-features = ["server", "test-utils"]
 
 [[test]]
