@@ -1,6 +1,4 @@
-//! Protocols used by the iroh-relay
+//! Protocols used by the relay.
 
-pub mod common;
-pub mod handshake;
 pub mod relay;
 pub mod streams;

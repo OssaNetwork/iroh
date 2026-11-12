@@ -1,6 +1,7 @@
-//! Exposes [`Client`], which allows to establish connections to a relay server.
+//! Client-side connection establishment to a relay server.
 //!
-//! Based on tailscale/derp/derphttp/derphttp_client.go
+//! [`WsDialer`] opens a WebSocket to one of the relay's endpoints. It handles DNS
+//! resolution, happy-eyeballs dialing, HTTP proxies and TLS.
 
 use std::{
     net::SocketAddr,
@@ -9,37 +10,22 @@ use std::{
     task::{self, Poll},
 };
 
-use conn::Conn;
-use iroh_base::{RelayUrl, SecretKey};
-#[cfg(not(wasm_browser))]
+use bytes::Bytes;
+use http::header::SEC_WEBSOCKET_PROTOCOL;
 use iroh_dns::dns::{DnsError, DnsResolver};
-#[cfg(wasm_browser)]
-use n0_error::StdResultExt;
-use n0_error::{AnyError, e, stack_error};
-use n0_future::{
-    Sink, Stream,
-    split::{SplitSink, SplitStream, split},
-    time,
-};
+use n0_error::{AnyError, StdResultExt, e, stack_error};
+use n0_future::{Sink, Stream, time};
 use tracing::{debug, trace};
 use url::Url;
 
-pub use self::conn::{RecvError, SendError};
+use self::streams::{MaybeTlsStream, ProxyStream};
 use crate::{
-    KeyCache,
-    http::{ProtocolVersion, RELAY_RELATIVE_PATH},
-    protos::{
-        handshake,
-        relay::{ClientToRelayMsg, RelayToClientMsg},
-    },
+    ExportKeyingMaterial,
+    protos::streams::{StreamError, WsBytesFramed},
 };
 
-pub(crate) mod conn;
-#[cfg(not(wasm_browser))]
 pub(crate) mod streams;
-#[cfg(not(wasm_browser))]
 mod tls;
-#[cfg(not(wasm_browser))]
 mod util;
 
 /// Connection errors.
@@ -54,26 +40,22 @@ pub enum ConnectError {
     InvalidWebsocketUrl { url: Url },
     #[error("Invalid relay URL: {url}")]
     InvalidRelayUrl { url: Url },
+    #[error("Invalid path, it must be relative to the relay URL: {path}")]
+    InvalidPath { path: String },
+    #[error("Invalid websocket subprotocol: {subprotocol}")]
+    InvalidSubprotocol { subprotocol: String },
     /// Error returned from the underlying WebSocket stream while establishing the connection.
     ///
-    /// The concrete error type is `tokio_websockets::Error` on native targets and
-    /// `ws_stream_wasm::WsErr` on `wasm_browser` targets. Use [`AnyError::downcast_ref`] to
-    /// recover it. Note that the concrete downcast type is not covered by any semver
+    /// The concrete error type is `tokio_websockets::Error`. Use [`AnyError::downcast_ref`]
+    /// to recover it. Note that the concrete downcast type is not covered by any semver
     /// guarantees and may change between releases.
     #[error(transparent)]
     Websocket { source: AnyError },
     #[error(
-        "Server replied with invalid iroh-relay version header: {}",
-        server_version.as_deref().unwrap_or("<empty>")
+        "Server replied with an unexpected websocket subprotocol: {}",
+        server_protocol.as_deref().unwrap_or("<empty>")
     )]
-    BadVersionHeader { server_version: Option<String> },
-    #[error("Authorization token set to a string that is not a valid HTTP header value")]
-    InvalidAuthToken,
-    #[error(transparent)]
-    Handshake {
-        #[error(std_err)]
-        source: handshake::Error,
-    },
+    BadSubprotocol { server_protocol: Option<String> },
     #[error(transparent)]
     Dial { source: DialError },
     #[error("Unexpected status during upgrade: {code}")]
@@ -96,9 +78,6 @@ pub enum ConnectError {
         "No rustls crypto provider configured while both ring and aws-lc-rs feature flags are disabled"
     )]
     MissingCryptoProvider,
-    #[cfg(wasm_browser)]
-    #[error("The relay protocol is not available in browsers")]
-    RelayProtoNotAvailable {},
 }
 
 /// Errors that can occur while dialing the relay server.
@@ -109,7 +88,6 @@ pub enum DialError {
     #[error("Invalid target port")]
     InvalidTargetPort {},
     #[error(transparent)]
-    #[cfg(not(wasm_browser))]
     Dns { source: DnsError },
     #[error(transparent)]
     Timeout {
@@ -138,48 +116,34 @@ pub enum DialError {
     ProxyInvalidTargetPort {},
 }
 
-/// Build a Client.
+/// Dials WebSocket connections to a relay server.
 #[derive(derive_more::Debug, Clone)]
-pub struct ClientBuilder {
-    /// Default is None
-    #[debug("address family selector callback")]
+pub struct WsDialer {
+    #[debug("address family selector: {}", address_family_selector.is_some())]
     address_family_selector: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    /// Server url.
-    url: RelayUrl,
-    /// TLS verification config.
+    /// The base URL of the relay server.
+    url: Url,
     tls_config: Option<rustls::ClientConfig>,
     /// HTTP Proxy
     proxy_url: Option<Url>,
-    /// The secret key of this client.
-    secret_key: SecretKey,
-    /// Optional authorization token.
-    ///
-    /// Sent as an `Authorization: Bearer` header on native targets and as
-    /// a `?token=` query parameter under Wasm. See [`ClientBuilder::auth_token`].
-    auth_token: Option<String>,
-    #[cfg(not(wasm_browser))]
     dns_resolver: DnsResolver,
-    /// Cache for public keys of remote endpoints.
-    key_cache: KeyCache,
+    /// Maximum WebSocket payload length accepted from the server.
+    max_payload_len: usize,
 }
 
-impl ClientBuilder {
-    /// Create a new [`ClientBuilder`]
-    pub fn new(
-        url: impl Into<RelayUrl>,
-        secret_key: SecretKey,
-        #[cfg(not(wasm_browser))] dns_resolver: DnsResolver,
-    ) -> Self {
-        ClientBuilder {
+impl WsDialer {
+    /// Creates a new [`WsDialer`] for the relay server at `url`.
+    ///
+    /// `max_payload_len` bounds the size of a single WebSocket message accepted from the
+    /// server.
+    pub fn new(url: Url, dns_resolver: DnsResolver, max_payload_len: usize) -> Self {
+        Self {
             address_family_selector: None,
-            url: url.into(),
+            url,
             tls_config: None,
             proxy_url: None,
-            secret_key,
-            #[cfg(not(wasm_browser))]
             dns_resolver,
-            key_cache: KeyCache::new(128),
-            auth_token: None,
+            max_payload_len,
         }
     }
 
@@ -231,46 +195,26 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets an authorization token.
+    /// Opens a WebSocket at `path`, relative to the relay URL, speaking `subprotocol`.
     ///
-    /// On native targets, the token is sent as an `Authorization: Bearer TOKEN`
-    /// header on the WebSocket upgrade request that establishes the relay
-    /// connection. The token must be a valid HTTP header field value, if not
-    /// [`Self::connect`] will return [`ConnectError::InvalidAuthToken`].
+    /// The relay URL is given with the `http` or `https` scheme; the matching `ws` or
+    /// `wss` scheme is used for the connection. The server must confirm `subprotocol`.
     ///
-    /// When compiled to WebAssembly the token is sent as a `?token=TOKEN`
-    /// query parameter on the upgrade URL, since browsers don't allow setting
-    /// headers on WebSocket requests.
-    pub fn auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
-        self
-    }
-
-    /// Set the capacity of the cache for public keys.
-    pub fn key_cache_capacity(mut self, capacity: usize) -> Self {
-        self.key_cache = KeyCache::new(capacity);
-        self
-    }
-
-    /// Establishes a new connection to the relay server.
-    #[cfg(not(wasm_browser))]
-    pub async fn connect(&self) -> Result<Client, ConnectError> {
-        use http::header::{AUTHORIZATION, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
-        use n0_error::StdResultExt;
-        use tls::MaybeTlsStreamBuilder;
-
-        use crate::{
-            http::CLIENT_AUTH_HEADER,
-            protos::{handshake::KeyMaterialClientAuth, relay::MAX_FRAME_SIZE},
-        };
-
-        let mut dial_url = self.url.join(RELAY_RELATIVE_PATH).map_err(|_| {
-            e!(ConnectError::InvalidRelayUrl {
-                url: (*self.url).clone()
+    /// `path` is joined onto the relay URL, so a relay served under a path prefix keeps
+    /// it: `https://example.com/prefix/` and `control` give
+    /// `https://example.com/prefix/control`. A `path` that would leave the relay URL, such
+    /// as an absolute path or a full URL, is rejected.
+    pub async fn connect(
+        &self,
+        path: &str,
+        subprotocol: &str,
+    ) -> Result<WsConnection, ConnectError> {
+        let mut dial_url = join_relative(&self.url, path)?;
+        let subprotocol_header = http::HeaderValue::from_str(subprotocol).map_err(|_| {
+            e!(ConnectError::InvalidSubprotocol {
+                subprotocol: subprotocol.to_string()
             })
         })?;
-        // The relay URL is exchanged with the http(s) scheme in tickets and similar.
-        // We need to use the ws:// or wss:// schemes when connecting with websockets, though.
         dial_url
             .set_scheme(match self.url.scheme() {
                 "http" => "ws",
@@ -290,11 +234,13 @@ impl ClientBuilder {
             .clone()
             .ok_or_else(|| e!(ConnectError::MissingCryptoProvider))?;
 
-        #[allow(unused_mut)]
-        let mut builder =
-            MaybeTlsStreamBuilder::new(dial_url.clone(), self.dns_resolver.clone(), tls_config)
-                .prefer_ipv6(self.prefer_ipv6())
-                .proxy_url(self.proxy_url.clone());
+        let builder = tls::MaybeTlsStreamBuilder::new(
+            dial_url.clone(),
+            self.dns_resolver.clone(),
+            tls_config,
+        )
+        .prefer_ipv6(self.prefer_ipv6())
+        .proxy_url(self.proxy_url.clone());
 
         let stream = builder.connect().await?;
         let local_addr = stream
@@ -302,40 +248,20 @@ impl ClientBuilder {
             .local_addr()
             .map_err(|_| e!(ConnectError::NoLocalAddr))?;
 
-        let mut builder = tokio_websockets::ClientBuilder::new()
+        let builder = tokio_websockets::ClientBuilder::new()
             .uri(dial_url.as_str())
             .map_err(|_| {
                 e!(ConnectError::InvalidRelayUrl {
                     url: dial_url.clone()
                 })
             })?
-            .add_header(
-                SEC_WEBSOCKET_PROTOCOL,
-                ProtocolVersion::all_as_header_value(),
-            )
+            .add_header(SEC_WEBSOCKET_PROTOCOL, subprotocol_header)
             .expect("valid header name and value")
-            .limits(tokio_websockets::Limits::default().max_payload_len(Some(MAX_FRAME_SIZE)))
-            // We turn off automatic flushing after a threshold (the default would be after 8KB).
-            // This means we need to flush manually, which we do by calling `Sink::send_all` or
-            // `Sink::send` (which calls `Sink::flush`) in the `ActiveRelayActor`.
+            .limits(tokio_websockets::Limits::default().max_payload_len(Some(self.max_payload_len)))
+            // Automatic flushing after a threshold is turned off (the default would be
+            // after 8KB). Users of the connection flush explicitly.
             .config(tokio_websockets::Config::default().flush_threshold(usize::MAX));
 
-        if let Some(token) = self.auth_token.as_ref() {
-            let value = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| e!(ConnectError::InvalidAuthToken))?;
-            builder = builder
-                .add_header(AUTHORIZATION, value)
-                .expect("valid header name");
-        }
-
-        if let Some(client_auth) = KeyMaterialClientAuth::new(&self.secret_key, &stream) {
-            debug!("Using TLS key export for relay client authentication");
-            builder = builder
-                .add_header(CLIENT_AUTH_HEADER, client_auth.into_header_value())
-                .expect(
-                    "impossible: CLIENT_AUTH_HEADER isn't a disallowed header value for websockets",
-                );
-        }
         let (conn, response) = builder.connect_on(stream).await.anyerr()?;
 
         n0_error::ensure!(
@@ -345,31 +271,22 @@ impl ClientBuilder {
             }
         );
 
-        let protocol_version_str = response
+        let server_protocol = response
             .headers()
             .get(SEC_WEBSOCKET_PROTOCOL)
             .and_then(|s| s.to_str().ok());
-        let protocol_version = protocol_version_str
-            .and_then(ProtocolVersion::match_from_str)
-            .ok_or_else(|| {
-                e!(ConnectError::BadVersionHeader {
-                    server_version: protocol_version_str.map(ToOwned::to_owned)
-                })
-            })?;
-
-        let conn = Conn::new(
-            conn,
-            self.key_cache.clone(),
-            &self.secret_key,
-            protocol_version,
-        )
-        .await?;
+        n0_error::ensure!(
+            server_protocol == Some(subprotocol),
+            ConnectError::BadSubprotocol {
+                server_protocol: server_protocol.map(ToOwned::to_owned)
+            }
+        );
 
         trace!("connect done");
 
-        Ok(Client {
-            conn,
-            local_addr: Some(local_addr),
+        Ok(WsConnection {
+            io: WsBytesFramed { io: conn },
+            local_addr,
         })
     }
 
@@ -378,188 +295,140 @@ impl ClientBuilder {
     /// Implementations should only return true if IPv6 is expected
     /// to succeed. (otherwise delaying IPv4 will delay the connection
     /// overall)
-    #[cfg(not(wasm_browser))]
     fn prefer_ipv6(&self) -> bool {
         match self.address_family_selector {
             Some(ref selector) => selector(),
             None => false,
         }
     }
+}
 
-    /// Establishes a new connection to the relay server.
-    #[cfg(wasm_browser)]
-    pub async fn connect(&self) -> Result<Client, ConnectError> {
-        use crate::http::AUTH_TOKEN_URL_QUERY_PARAM;
-
-        let mut dial_url = self.url.join(RELAY_RELATIVE_PATH).map_err(|_| {
-            e!(ConnectError::InvalidRelayUrl {
-                url: (*self.url).clone()
-            })
-        })?;
-        // The relay URL is exchanged with the http(s) scheme in tickets and similar.
-        // We need to use the ws:// or wss:// schemes when connecting with websockets, though.
-        dial_url
-            .set_scheme(match self.url.scheme() {
-                "http" => "ws",
-                "ws" => "ws",
-                _ => "wss",
-            })
-            .map_err(|_| {
-                e!(ConnectError::InvalidWebsocketUrl {
-                    url: dial_url.clone()
-                })
-            })?;
-
-        if let Some(token) = self.auth_token.as_ref() {
-            dial_url
-                .query_pairs_mut()
-                .append_pair(AUTH_TOKEN_URL_QUERY_PARAM, token);
-        }
-
-        debug!(%dial_url, "Dialing relay by websocket");
-
-        let (ws_meta, ws_stream) = ws_stream_wasm::WsMeta::connect(
-            dial_url.as_str(),
-            Some(ProtocolVersion::all().collect()),
-        )
-        .await
-        .anyerr()?;
-
-        let protocol_version =
-            ProtocolVersion::match_from_str(&ws_meta.protocol()).ok_or_else(|| {
-                e!(ConnectError::BadVersionHeader {
-                    server_version: Some(ws_meta.protocol())
-                })
-            })?;
-
-        let conn = Conn::new(
-            ws_stream,
-            self.key_cache.clone(),
-            &self.secret_key,
-            protocol_version,
-        )
-        .await?;
-
-        trace!("connect done");
-
-        Ok(Client {
-            conn,
-            local_addr: None,
+/// Joins `path` onto `base`, rejecting paths that do not stay below `base`.
+fn join_relative(base: &Url, path: &str) -> Result<Url, ConnectError> {
+    let invalid = || {
+        e!(ConnectError::InvalidPath {
+            path: path.to_string()
         })
-    }
+    };
+    let joined = base.join(path).map_err(|_| invalid())?;
+    // The directory of the base URL: everything up to and including the last slash.
+    let base_dir = match base.path().rfind('/') {
+        Some(idx) => &base.path()[..=idx],
+        None => "/",
+    };
+    let same_origin = joined.scheme() == base.scheme()
+        && joined.host() == base.host()
+        && joined.port_or_known_default() == base.port_or_known_default();
+    n0_error::ensure!(
+        same_origin && joined.path().starts_with(base_dir),
+        ConnectError::InvalidPath {
+            path: path.to_string()
+        }
+    );
+    Ok(joined)
 }
 
-/// A relay client.
+/// An established WebSocket connection to a relay server.
+///
+/// This is a [`Stream`] and a [`Sink`] of binary messages. Messages are not flushed
+/// automatically.
 #[derive(Debug)]
-pub struct Client {
-    conn: Conn,
-    local_addr: Option<SocketAddr>,
+pub struct WsConnection {
+    io: WsBytesFramed<MaybeTlsStream<ProxyStream>>,
+    local_addr: SocketAddr,
 }
 
-impl Client {
-    /// Splits the client into a sink and a stream.
-    pub fn split(self) -> (ClientStream, ClientSink) {
-        let (sink, stream) = split(self.conn);
-        (
-            ClientStream {
-                stream,
-                local_addr: self.local_addr,
-            },
-            ClientSink { sink },
-        )
-    }
-}
-
-impl Stream for Client {
-    type Item = Result<RelayToClientMsg, RecvError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.conn).poll_next(cx)
-    }
-}
-
-impl Sink<ClientToRelayMsg> for Client {
-    type Error = SendError;
-
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.conn).poll_ready(cx)
-    }
-
-    fn start_send(mut self: Pin<&mut Self>, item: ClientToRelayMsg) -> Result<(), Self::Error> {
-        Pin::new(&mut self.conn).start_send(item)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.conn).poll_flush(cx)
-    }
-
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.conn).poll_close(cx)
-    }
-}
-
-/// The send half of a relay client.
-#[derive(Debug)]
-pub struct ClientSink {
-    sink: SplitSink<Conn, ClientToRelayMsg>,
-}
-
-impl Sink<ClientToRelayMsg> for ClientSink {
-    type Error = SendError;
-
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.sink).poll_ready(cx)
-    }
-
-    fn start_send(mut self: Pin<&mut Self>, item: ClientToRelayMsg) -> Result<(), Self::Error> {
-        Pin::new(&mut self.sink).start_send(item)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.sink).poll_flush(cx)
-    }
-
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.sink).poll_close(cx)
-    }
-}
-
-/// The receive half of a relay client.
-#[derive(Debug)]
-pub struct ClientStream {
-    stream: SplitStream<Conn>,
-    local_addr: Option<SocketAddr>,
-}
-
-impl ClientStream {
-    /// Returns the local address of the client.
-    pub fn local_addr(&self) -> Option<SocketAddr> {
+impl WsConnection {
+    /// Returns the local address of the underlying TCP connection.
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 }
 
-impl Stream for ClientStream {
-    type Item = Result<RelayToClientMsg, RecvError>;
+impl ExportKeyingMaterial for WsConnection {
+    fn export_keying_material<T: AsMut<[u8]>>(
+        &self,
+        output: T,
+        label: &[u8],
+        context: Option<&[u8]>,
+    ) -> Option<T> {
+        self.io.export_keying_material(output, label, context)
+    }
+}
+
+impl Stream for WsConnection {
+    type Item = Result<Bytes, StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+        Pin::new(&mut self.io).poll_next(cx)
+    }
+}
+
+impl Sink<Bytes> for WsConnection {
+    type Error = StreamError;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.io).poll_ready(cx)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        Pin::new(&mut self.io).start_send(item)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.io).poll_close(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_relative_keeps_the_relay_url() {
+        let join = |base: &str, path: &str| {
+            join_relative(&Url::parse(base).unwrap(), path).map(|url| url.to_string())
+        };
+        assert_eq!(
+            join("https://example.com", "control").unwrap(),
+            "https://example.com/control"
+        );
+        assert_eq!(
+            join("https://example.com/prefix/", "tunnel/443").unwrap(),
+            "https://example.com/prefix/tunnel/443"
+        );
+        assert_eq!(
+            join("https://198.51.100.7:8443/", "tunnel/443").unwrap(),
+            "https://198.51.100.7:8443/tunnel/443"
+        );
+
+        for path in [
+            "/control",
+            "//other.example/control",
+            "https://other.example/control",
+            "http://example.com/prefix/control",
+            "../control",
+        ] {
+            assert!(
+                matches!(
+                    join("https://example.com/prefix/", path),
+                    Err(ConnectError::InvalidPath { .. })
+                ),
+                "path must be rejected: {path}"
+            );
+        }
     }
 }
