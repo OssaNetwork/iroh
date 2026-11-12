@@ -7,35 +7,23 @@ use std::{
 
 use bytes::Bytes;
 use n0_error::AnyError;
-#[cfg(not(wasm_browser))]
 use n0_error::anyerr;
 use n0_future::{Sink, Stream, ready};
-#[cfg(not(wasm_browser))]
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::warn;
 
 use crate::ExportKeyingMaterial;
 
-#[cfg(not(wasm_browser))]
 #[derive(derive_more::Debug)]
 pub(crate) struct WsBytesFramed<T> {
     #[debug("WebSocketStream<T>")]
     pub(crate) io: tokio_websockets::WebSocketStream<T>,
 }
 
-#[cfg(wasm_browser)]
-#[derive(derive_more::Debug)]
-pub(crate) struct WsBytesFramed {
-    #[debug("WebSocketStream")]
-    pub(crate) io: ws_stream_wasm::WsStream,
-}
-
 /// Error type for WebSocket stream operations.
 ///
 /// This is a generic [`AnyError`] and represents errors that can occur during WebSocket
-/// communication. The underlying error type depends on the platform:
-/// - On non-browser platforms: `tokio_websockets::Error`
-/// - On browser WASM: `ws_stream_wasm::WsErr`
+/// communication. The underlying error type is `tokio_websockets::Error`.
 ///
 /// You can use [`AnyError::downcast_ref`] to downcast to the concrete error. However, the
 /// downcast is not covered by any semver guarantees and the underlying error may change.
@@ -52,7 +40,6 @@ impl<T> BytesStreamSink for T where
 {
 }
 
-#[cfg(not(wasm_browser))]
 impl<IO: ExportKeyingMaterial + AsyncRead + AsyncWrite + Unpin> ExportKeyingMaterial
     for WsBytesFramed<IO>
 {
@@ -68,19 +55,6 @@ impl<IO: ExportKeyingMaterial + AsyncRead + AsyncWrite + Unpin> ExportKeyingMate
     }
 }
 
-#[cfg(wasm_browser)]
-impl ExportKeyingMaterial for WsBytesFramed {
-    fn export_keying_material<T: AsMut<[u8]>>(
-        &self,
-        _output: T,
-        _label: &[u8],
-        _context: Option<&[u8]>,
-    ) -> Option<T> {
-        None
-    }
-}
-
-#[cfg(not(wasm_browser))]
 impl<T: AsyncRead + AsyncWrite + Unpin> Stream for WsBytesFramed<T> {
     type Item = Result<Bytes, StreamError>;
 
@@ -109,62 +83,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for WsBytesFramed<T> {
     }
 }
 
-#[cfg(wasm_browser)]
-impl Stream for WsBytesFramed {
-    type Item = Result<Bytes, StreamError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match ready!(Pin::new(&mut self.io).poll_next(cx)) {
-                None => return Poll::Ready(None),
-                Some(ws_stream_wasm::WsMessage::Binary(msg)) => {
-                    return Poll::Ready(Some(Ok(msg.into())));
-                }
-                Some(msg) => {
-                    warn!(?msg, "Got websocket message of unsupported type, skipping.");
-                    continue;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(wasm_browser))]
 impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Bytes> for WsBytesFramed<T> {
     type Error = StreamError;
 
     fn start_send(mut self: Pin<&mut Self>, bytes: Bytes) -> Result<(), Self::Error> {
         let msg = tokio_websockets::Message::binary(tokio_websockets::Payload::from(bytes));
-        Pin::new(&mut self.io)
-            .start_send(msg)
-            .map_err(AnyError::from_std)
-    }
-
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.io)
-            .poll_ready(cx)
-            .map_err(AnyError::from_std)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.io)
-            .poll_flush(cx)
-            .map_err(AnyError::from_std)
-    }
-
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.io)
-            .poll_close(cx)
-            .map_err(AnyError::from_std)
-    }
-}
-
-#[cfg(wasm_browser)]
-impl Sink<Bytes> for WsBytesFramed {
-    type Error = StreamError;
-
-    fn start_send(mut self: Pin<&mut Self>, bytes: Bytes) -> Result<(), Self::Error> {
-        let msg = ws_stream_wasm::WsMessage::Binary(Vec::from(bytes));
         Pin::new(&mut self.io)
             .start_send(msg)
             .map_err(AnyError::from_std)

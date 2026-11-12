@@ -192,7 +192,6 @@ jobs:
           cargo ndk test --locked --no-run -p iroh-base --all-features
           cargo ndk test --locked --no-run -p iroh-dns --features tls-ring
           cargo ndk test --locked --no-run -p iroh-relay --features tls-ring,metrics
-          cargo ndk test --locked --no-run -p iroh --features tls-ring,metrics,portmapper,test-utils
 
       - name: Run workspace tests on Android emulator
         if: matrix.target == 'x86_64-linux-android'
@@ -248,7 +247,6 @@ jobs:
             cargo ndk test --locked -p iroh-base --all-features
             cargo ndk test --locked -p iroh-dns --features tls-ring
             cargo ndk test --locked -p iroh-relay --features tls-ring,metrics
-            cargo ndk test --locked -p iroh --features tls-ring,metrics,portmapper,test-utils
 
   cross_test:
     name: Cross Test
@@ -299,61 +297,6 @@ jobs:
           RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG' }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
 
-  wasm_test:
-    name: Build & test wasm32 for browsers
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    env:
-      RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Setup node.js version 22.5 # needed for browser-like websocket API support in node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22.5
-
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Install wasm-bindgen-test-runner
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        with:
-          # Match the version of wasm-bindgen used in Cargo.lock
-          tool: wasm-bindgen-cli@0.2.128
-
-      - name: Install wasm-tools
-        uses: bytecodealliance/actions/wasm-tools/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
-
-      - name: wasm32 build (iroh-base)
-        run: cargo build --locked --target wasm32-unknown-unknown -p iroh-base --all-features
-
-      - name: wasm32 build (iroh-relay)
-        run: cargo build --locked --target wasm32-unknown-unknown -p iroh-relay
-
-      - name: wasm32 build (iroh)
-        run: cargo build --locked --target wasm32-unknown-unknown -p iroh
-
-      # If the Wasm file contains any 'import "env"' declarations, then
-      # some non-Wasm-compatible code made it into the final code.
-      - name: Ensure no 'import "env"' in iroh-relay Wasm
-        run: |
-          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/iroh_relay.wasm | grep 'import "env"'
-
-      - name: Ensure no 'import "env"' in iroh Wasm
-        run: |
-          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/iroh.wasm | grep 'import "env"'
-
-      - name: Run integration test in wasm
-        run: cargo test --locked -p iroh --test integration --target=wasm32-unknown-unknown
-
   check_semver:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     env:
@@ -372,7 +315,7 @@ jobs:
         # uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         uses: n0-computer/cargo-semver-checks-action@b49de9133f8849bb51cae32c6bdeb19a5c37e61f # feat-baseline
         with:
-          package: iroh, iroh-base, iroh-dns, iroh-dns-server, iroh-relay
+          package: iroh-base, iroh-dns, iroh-relay
 
   check_external_types:
     timeout-minutes: 30
@@ -493,31 +436,6 @@ jobs:
       - name: clippy check (default features)
         run: cargo clippy --locked --workspace --all-targets --lib --bins --tests --benches --examples
 
-  check_optional_deps:
-    timeout-minutes: 10
-    name: Check optional deps are absent without features
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-      - name: Verify optional deps are absent without features
-        run: |
-          fail=0
-          for dep in portmapper igd-next swarm-discovery ring aws-lc-rs; do
-            echo    "cargo tree --locked -p iroh --no-default-features --edges normal --target all -i $dep";
-            output=$(cargo tree --locked -p iroh --no-default-features --edges normal --target all -i "$dep" 2>&1) || true
-            if ! echo "$output" | grep -qE "(nothing to print|did not match any packages)"; then
-              echo "ERROR: $dep should not be in the dependency tree without its feature"
-              echo "$output"
-              fail=1
-            fi
-          done
-          exit $fail
-
   msrv:
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
@@ -555,27 +473,6 @@ jobs:
           arguments: --workspace --all-features
           command: check
           command-arguments: "-Dwarnings"
-
-  netsim-integration-tests:
-    permissions:
-      contents: read
-      pull-requests: write   # netsim_runner posts the report comment
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
-    uses: "$/.github/workflows/netsim_runner.yaml"
-    secrets:
-      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-      S3_BUCKET: ${{ secrets.S3_BUCKET }}
-      S3_REPORT_BUCKET: ${{ secrets.S3_REPORT_BUCKET }}
-      METRO_TOKEN: ${{ secrets.METRO_TOKEN }}
-      METRO_ENDPOINT: ${{ secrets.METRO_ENDPOINT }}
-    with:
-      branch: ${{ github.ref }}
-      max_workers: 6
-      netsim_branch: "main"
-      sim_paths: ${{ github.event_name == 'pull_request' && 'sims/integration' || 'sims/iroh/iroh.json,sims/integration' }}
-      pr_number: ${{ github.event.pull_request.number || '' }}
-      filter: ${{ github.event_name == 'pull_request' && 'skip:intg_iroh_full__1_to_3,intg_iroh_full__1_to_1x3,intg_iroh_relay_only__1_to_3' || '' }}
 
   codespell:
     timeout-minutes: 30

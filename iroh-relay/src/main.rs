@@ -1,46 +1,31 @@
-//! The relay server for iroh.
+//! The relay server.
 //!
 //! This handles only the CLI and config file loading, the server implementation lives in
-//! [`iroh::relay::server`].
+//! [`iroh_relay::server`].
 
 use std::{
     net::{Ipv6Addr, SocketAddr},
-    num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use clap::Parser;
-use http::StatusCode;
-use iroh_base::EndpointId;
 use iroh_relay::{
     defaults::{
         DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, DEFAULT_METRICS_PORT, DEFAULT_RELAY_QUIC_PORT,
     },
     server::{
-        self as relay, Access, AccessControl, AcmeConfig, ClientRateLimit, ClientRequest,
-        DEFAULT_CERT_RELOAD_INTERVAL, QuicConfig, reloading_resolver,
+        self as relay, AcmeConfig, DEFAULT_CERT_RELOAD_INTERVAL, QuicConfig, reloading_resolver,
     },
     tls::CaTlsConfig,
 };
-use n0_error::{AnyError, Result, StdResultExt, bail_any};
+use n0_error::{Result, StdResultExt, bail_any};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 use tracing_subscriber::{EnvFilter, prelude::*};
-use url::Url;
 use webpki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 /// The default `http_bind_port` when using `--dev`.
 const DEV_MODE_HTTP_PORT: u16 = 3340;
-/// The header name for setting the endpoint id in HTTP auth requests.
-const X_IROH_ENDPOINT_ID: &str = "X-Iroh-Endpoint-Id";
-/// Deprecated name for `X-Iroh-Endpoint-Id`. Sent temporarily so existing auth services keep working.
-// Removal tracked in https://github.com/n0-computer/iroh/issues/4585
-const X_IROH_NODE_ID_DEPRECATED: &str = "X-Iroh-NodeId";
-/// Environment variable to read a bearer token for HTTP auth requests from.
-const ENV_HTTP_BEARER_TOKEN: &str = "IROH_RELAY_HTTP_BEARER_TOKEN";
-/// Environment variable to verify relay access (without an external auth service)
-const ENV_RELAY_ACCESS_TOKEN: &str = "IROH_RELAY_ACCESS_TOKEN";
 /// Environment variable to override the ACME directory URL.
 const ENV_ACME_URL: &str = "IROH_RELAY_ACME_URL";
 /// Environment variable to trust an additional CA for the ACME server's TLS certificate.
@@ -91,7 +76,12 @@ fn load_secret_key(
 /// Configuration for the relay-server.
 ///
 /// This is (de)serialised to/from a TOML config file.
+///
+/// Unknown fields are rejected. The `access`, `limits` and `key_cache_capacity` fields
+/// of iroh's relay no longer exist, and silently ignoring them would start a server
+/// without the restrictions its config asks for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     /// Whether to enable the Relay server.
     ///
@@ -135,10 +125,6 @@ struct Config {
     /// Defaults to `false`
     #[serde(default = "cfg_defaults::enable_quic_addr_discovery")]
     enable_quic_addr_discovery: bool,
-    /// Rate limiting configuration.
-    ///
-    /// Disabled if not present.
-    limits: Option<Limits>,
     /// Whether to run the metrics server.
     ///
     /// Defaults to `true`, when the metrics feature is enabled.
@@ -149,195 +135,6 @@ struct Config {
     /// Defaults to `http_bind_addr` with the port set to [`DEFAULT_METRICS_PORT`]
     /// (`[::]:9090` when `http_bind_addr` is set to the default).
     metrics_bind_addr: Option<SocketAddr>,
-    /// The capacity of the key cache.
-    key_cache_capacity: Option<usize>,
-    /// Access control for relaying connections.
-    ///
-    /// This controls which endpoints are allowed to relay connections, other endpoints are not controlled by this.
-    #[serde(default)]
-    access: AccessConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum AccessConfig {
-    /// Allows everyone
-    #[default]
-    Everyone,
-    /// Allows only these endpoints.
-    Allowlist(Vec<EndpointId>),
-    /// Allows everyone, except these endpoints.
-    Denylist(Vec<EndpointId>),
-    /// Performs a HTTP POST request to determine access for each endpoint that connects to the relay.
-    ///
-    /// The request will have a header `X-Iroh-Endpoint-Id` set to the hex-encoded endpoint id attempting
-    /// to connect to the relay. For backwards compatibility, the same value is also sent in the
-    /// deprecated `X-Iroh-NodeId` header, which will be removed in a future release.
-    ///
-    /// To grant access, the HTTP endpoint must return a `200` response with `true` as the response text.
-    /// In all other cases, the endpoint will be denied access.
-    Http(HttpAccessConfig),
-    #[serde(rename = "shared_token")]
-    /// Allows only clients that present one of the configured bearer tokens.
-    ///
-    /// The token is read from the `Authorization: Bearer <token>` request header,
-    /// or from the `?token=` URL query parameter as a fallback.
-    /// All other connections are denied.
-    ///
-    /// The token list can also be overridden by the `IROH_RELAY_ACCESS_TOKEN` environment
-    /// variable, which sets a single allowed token and takes precedence over the config
-    /// file value. A single value is used (rather than a comma-separated list) to avoid
-    /// restricting the character set of tokens.
-    ///
-    /// The token list must not be empty, and no token may be an empty string;
-    /// the server will fail to start if either condition is violated.
-    ///
-    /// # Example
-    ///
-    /// ```toml
-    /// access.shared_token = ["token-a", "token-b"]
-    /// ```
-    SharedToken(Vec<String>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct HttpAccessConfig {
-    /// The URL to send the `POST` request to.
-    url: Url,
-    /// Optional bearer token for authorizing to the HTTP endpoint.
-    ///
-    /// If set, an `Authorization: Bearer {token}` header will be set on the HTTP request.
-    /// The bearer token can also be set via the `IROH_RELAY_HTTP_BEARER_TOKEN` environment variable.
-    /// If both the config and the environment variable are set, the value from the environment variable
-    /// is used.
-    bearer_token: Option<String>,
-}
-
-impl TryFrom<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
-    type Error = AnyError;
-
-    fn try_from(cfg: AccessConfig) -> Result<Self> {
-        match cfg {
-            AccessConfig::Everyone => Ok(Arc::new(iroh_relay::server::AllowAll)),
-            AccessConfig::Allowlist(allow_list) => Ok(Arc::new(AllowlistAccess(allow_list))),
-            AccessConfig::Denylist(deny_list) => Ok(Arc::new(DenylistAccess(deny_list))),
-            AccessConfig::Http(mut config) => {
-                let client = reqwest::Client::builder()
-                    .use_rustls_tls()
-                    .build()
-                    .expect("request client builder");
-                // Allow to set bearer token via environment variable as well.
-                if let Ok(token) = std::env::var(ENV_HTTP_BEARER_TOKEN) {
-                    config.bearer_token = Some(token);
-                }
-                Ok(Arc::new(HttpAccess { client, config }))
-            }
-            AccessConfig::SharedToken(mut tokens) => {
-                // A single env var token replaces the entire list. A comma-separated list
-                // is intentionally not supported to avoid restricting the token character set.
-                if let Ok(env_token) = std::env::var(ENV_RELAY_ACCESS_TOKEN) {
-                    tokens = vec![env_token];
-                }
-                if tokens.is_empty() || tokens.iter().any(|t| t.is_empty()) {
-                    bail_any!("access.shared_token must not be empty or contain empty strings");
-                }
-                Ok(Arc::new(SharedTokenAccess(tokens)))
-            }
-        }
-    }
-}
-
-/// An [`AccessControl`] admitting only an allowlist of endpoints.
-#[derive(Debug)]
-struct AllowlistAccess(Vec<EndpointId>);
-
-impl AccessControl for AllowlistAccess {
-    async fn on_connect(&self, request: &ClientRequest) -> Access {
-        if self.0.contains(&request.endpoint_id()) {
-            Access::Allow
-        } else {
-            Access::Deny { reason: None }
-        }
-    }
-}
-
-/// An [`AccessControl`] admitting everyone except a denylist of endpoints.
-#[derive(Debug)]
-struct DenylistAccess(Vec<EndpointId>);
-
-impl AccessControl for DenylistAccess {
-    async fn on_connect(&self, request: &ClientRequest) -> Access {
-        if self.0.contains(&request.endpoint_id()) {
-            Access::Deny { reason: None }
-        } else {
-            Access::Allow
-        }
-    }
-}
-
-/// An [`AccessControl`] admitting only clients that present one of the configured bearer tokens.
-#[derive(Debug)]
-struct SharedTokenAccess(Vec<String>);
-
-impl AccessControl for SharedTokenAccess {
-    async fn on_connect(&self, request: &ClientRequest) -> Access {
-        match request.auth_token() {
-            Some(token) if self.0.contains(&token) => Access::Allow,
-            _ => Access::Deny { reason: None },
-        }
-    }
-}
-
-/// An [`AccessControl`] that delegates the decision to an HTTP endpoint.
-#[derive(Debug)]
-struct HttpAccess {
-    client: reqwest::Client,
-    config: HttpAccessConfig,
-}
-
-impl AccessControl for HttpAccess {
-    #[tracing::instrument("http-access-check", skip_all, fields(endpoint_id=%request.endpoint_id().fmt_short()))]
-    async fn on_connect(&self, request: &ClientRequest) -> Access {
-        debug!(url=%self.config.url, "Check relay access via HTTP POST");
-
-        match http_access_check_inner(&self.client, &self.config, request.endpoint_id()).await {
-            Ok(()) => {
-                debug!("HTTP access check OK: Allow access");
-                Access::Allow
-            }
-            Err(err) => {
-                debug!("HTTP access check failed: Deny access (reason: {err:#})");
-                Access::Deny { reason: None }
-            }
-        }
-    }
-}
-
-async fn http_access_check_inner(
-    client: &reqwest::Client,
-    config: &HttpAccessConfig,
-    endpoint_id: EndpointId,
-) -> Result<()> {
-    let mut request = client
-        .post(config.url.clone())
-        .header(X_IROH_ENDPOINT_ID, endpoint_id.to_string())
-        .header(X_IROH_NODE_ID_DEPRECATED, endpoint_id.to_string());
-    if let Some(token) = config.bearer_token.as_ref() {
-        request = request.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-
-    match request.send().await {
-        Err(err) => {
-            warn!("Failed to retrieve response for HTTP access check: {err:#}");
-            Err(err).std_context("Failed to fetch response")
-        }
-        Ok(res) if res.status() == StatusCode::OK => match res.text().await {
-            Ok(text) if text == "true" => Ok(()),
-            Ok(_) => bail_any!("Invalid response text (must be 'true')"),
-            Err(err) => Err(err).std_context("Failed to read response"),
-        },
-        Ok(res) => bail_any!("Received invalid status code ({})", res.status()),
-    }
 }
 
 impl Config {
@@ -359,11 +156,8 @@ impl Default for Config {
             http_bind_addr: None,
             tls: None,
             enable_quic_addr_discovery: cfg_defaults::enable_quic_addr_discovery(),
-            limits: None,
             enable_metrics: cfg_defaults::enable_metrics(),
             metrics_bind_addr: None,
-            key_cache_capacity: Default::default(),
-            access: AccessConfig::Everyone,
         }
     }
 }
@@ -397,6 +191,7 @@ mod cfg_defaults {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TlsConfig {
     /// The socket address to bind the Relay HTTPS server on.
     ///
@@ -505,37 +300,6 @@ where
         StringOrVec::One(s) => vec![s],
         StringOrVec::Many(v) => v,
     })
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Limits {
-    /// Rate limit for accepting new connection. Unlimited if not set.
-    accept_conn_limit: Option<f64>,
-    /// Burst limit for accepting new connection. Unlimited if not set.
-    accept_conn_burst: Option<usize>,
-    /// Rate limiting configuration per client.
-    client: Option<PerClientRateLimitConfig>,
-}
-
-/// Rate limit configuration for each connected client.
-///
-/// The rate limiting uses a token-bucket style algorithm:
-///
-/// - The base rate limit uses a steady-stream rate of bytes allowed.
-/// - Additionally a burst quota allows sending bytes over this steady-stream rate
-///   limit, as long as the maximum burst quota is not exceeded.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct PerClientRateLimitConfig {
-    /// Rate limit configuration for the incoming data from the client.
-    rx: Option<RateLimitConfig>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct RateLimitConfig {
-    /// Maximum number of bytes per second.
-    bytes_per_second: Option<u32>,
-    /// Maximum number of bytes to read in a single burst.
-    max_burst_bytes: Option<u32>,
 }
 
 impl Config {
@@ -729,47 +493,9 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
         (None, None)
     };
 
-    let limits = match cfg.limits {
-        Some(ref limits) => {
-            let client_rx = match &limits.client {
-                Some(PerClientRateLimitConfig { rx: Some(rx) }) => {
-                    if rx.bytes_per_second.is_none() && rx.max_burst_bytes.is_some() {
-                        bail_any!("bytes_per_seconds must be specified to enable the rate-limiter");
-                    }
-                    match rx.bytes_per_second {
-                        Some(bps) => {
-                            let bps = TryInto::<NonZeroU32>::try_into(bps)
-                                .std_context("bytes_per_second must be non-zero u32")?;
-                            let mut limit = ClientRateLimit::new(bps);
-                            limit.max_burst_bytes = rx
-                                .max_burst_bytes
-                                .map(|v| {
-                                    TryInto::<NonZeroU32>::try_into(v)
-                                        .std_context("max_burst_bytes must be non-zero u32")
-                                })
-                                .transpose()?;
-                            Some(limit)
-                        }
-                        None => None,
-                    }
-                }
-                Some(PerClientRateLimitConfig { rx: None }) | None => None,
-            };
-            let mut out = relay::Limits::default();
-            out.accept_conn_limit = limits.accept_conn_limit;
-            out.accept_conn_burst = limits.accept_conn_burst;
-            out.client_rx = client_rx;
-            out
-        }
-        None => Default::default(),
-    };
-
     let relay_config = if cfg.enable_relay {
         let mut relay_config = relay::RelayConfig::new(cfg.http_bind_addr());
         relay_config.tls = tls_config;
-        relay_config.limits = limits;
-        relay_config.key_cache_capacity = cfg.key_cache_capacity;
-        relay_config.access = cfg.access.clone().try_into()?;
         Some(relay_config)
     } else {
         None
@@ -787,155 +513,24 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
-
-    use iroh_base::SecretKey;
     use n0_error::Result;
-    use rand::{RngExt, SeedableRng};
-    use rand_chacha::ChaCha8Rng;
 
     use super::*;
 
-    #[tokio::test]
-    async fn test_rate_limit_config() -> Result {
-        let config = "
-            [limits.client.rx]
-            bytes_per_second = 400
-            max_burst_bytes = 800
-        ";
-        let config = Config::from_str(config)?;
-        let relay_config = build_relay_config(config).await?;
-
-        let relay = relay_config.relay.expect("no relay config");
-        assert_eq!(
-            relay.limits.client_rx.expect("ratelimit").bytes_per_second,
-            NonZeroU32::try_from(400).unwrap()
-        );
-        assert_eq!(
-            relay.limits.client_rx.expect("ratelimit").max_burst_bytes,
-            Some(NonZeroU32::try_from(800).unwrap())
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_rate_limit_default() -> Result {
-        let config = Config::from_str("")?;
-        let relay_config = build_relay_config(config).await?;
-
-        let relay = relay_config.relay.expect("no relay config");
-        assert!(relay.limits.client_rx.is_none());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_access_config() -> Result {
-        let config = "
-            access = \"everyone\"
-        ";
-        let config = Config::from_str(config)?;
-        assert_eq!(config.access, AccessConfig::Everyone);
-
-        let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let endpoint_id = SecretKey::from_bytes(&rng.random()).public();
-
-        let config = format!(
-            "
-            access.allowlist = [
-              \"{endpoint_id}\",
-            ]
-        "
-        );
-        let config = Config::from_str(dbg!(&config))?;
-        assert_eq!(config.access, AccessConfig::Allowlist(vec![endpoint_id]));
-
-        let config = r#"
-            access.http.url = "https://example.com/foo/bar?boo=baz"
-        "#
-        .to_string();
-        let config = Config::from_str(dbg!(&config))?;
-        assert_eq!(
-            config.access,
-            AccessConfig::Http(HttpAccessConfig {
-                url: "https://example.com/foo/bar?boo=baz".parse().unwrap(),
-                bearer_token: None
-            })
-        );
-        let config = r#"
-            access.http.url = "https://example.com/foo/bar?boo=baz"
-            access.http.bearer_token = "foo"
-        "#
-        .to_string();
-        let config = Config::from_str(dbg!(&config))?;
-        assert_eq!(
-            config.access,
-            AccessConfig::Http(HttpAccessConfig {
-                url: "https://example.com/foo/bar?boo=baz".parse().unwrap(),
-                bearer_token: Some("foo".to_string())
-            })
-        );
-
-        let config = r#"
-            access.http = { url = "https://example.com/foo" }
-        "#
-        .to_string();
-        let config = Config::from_str(dbg!(&config))?;
-        assert_eq!(
-            config.access,
-            AccessConfig::Http(HttpAccessConfig {
-                url: "https://example.com/foo".parse().unwrap(),
-                bearer_token: None
-            })
-        );
-
-        let config = r#"
-            access.http = { url = "https://example.com/foo", bearer_token = "foo" }
-        "#
-        .to_string();
-        let config = Config::from_str(dbg!(&config))?;
-        assert_eq!(
-            config.access,
-            AccessConfig::Http(HttpAccessConfig {
-                url: "https://example.com/foo".parse().unwrap(),
-                bearer_token: Some("foo".to_string())
-            })
-        );
-
-        let config = r#"
-            access.shared_token = ["token-a", "token-b"]
-        "#
-        .to_string();
-        let config = Config::from_str(dbg!(&config))?;
-        assert_eq!(
-            config.access,
-            AccessConfig::SharedToken(vec!["token-a".to_string(), "token-b".to_string()])
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_access_token_empty_is_rejected() -> Result {
-        let config = r#"
-            access.shared_token = []
-        "#;
-        let config = Config::from_str(config)?;
-        assert!(
-            build_relay_config(config).await.is_err(),
-            "empty token list should be rejected at startup"
-        );
-
-        let config = r#"
-            access.shared_token = [""]
-        "#;
-        let config = Config::from_str(config)?;
-        assert!(
-            build_relay_config(config).await.is_err(),
-            "empty string token should be rejected at startup"
-        );
-        Ok(())
+    #[test]
+    fn test_removed_fields_are_rejected() {
+        for config in [
+            "access = \"everyone\"",
+            "access.allowlist = []",
+            "access.shared_token = [\"token\"]",
+            "key_cache_capacity = 1024",
+            "[limits.client.rx]\nbytes_per_second = 400",
+        ] {
+            assert!(
+                Config::from_str(config).is_err(),
+                "config must be rejected: {config}"
+            );
+        }
     }
 
     #[tokio::test]
